@@ -241,6 +241,16 @@ static int vtx_handle_fragment(
     /* 标记分片已接收 */
     vtx_frame_mark_frag_received(frame, header->frag_index);
 
+    /* 对于I帧，发送分片ACK */
+    if (header->frame_type == VTX_FRAME_I) {
+        vtx_packet_header_t ack_header = {0};
+        ack_header.seq_num = atomic_fetch_add(&rx->seq_num, 1);
+        ack_header.frame_id = header->frame_id;
+        ack_header.frag_index = header->frag_index;
+        ack_header.frame_type = VTX_DATA_ACK;
+        vtx_send_packet(rx, &ack_header, NULL, 0);
+    }
+
     /* 更新统计 */
     vtx_spinlock_lock(&rx->stats_lock);
     rx->stats.total_packets++;

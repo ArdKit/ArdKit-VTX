@@ -343,13 +343,31 @@ static int vtx_recv(vtx_tx_t* tx) {
     /* 使用状态机处理数据帧 */
     switch (header.frame_type) {
     case VTX_DATA_ACK: {
-        /* ACK包，从data_queue中移除对应的frame */
-        vtx_frame_t* frame = vtx_frame_queue_find(tx->data_queue,
-                                                   header.frame_id);
-        if (frame) {
-            vtx_frame_queue_remove(tx->data_queue, frame);
-            vtx_frame_release(tx->data_pool, frame);
+        /* ACK包，可能是数据帧ACK或媒体帧分片ACK */
+
+        /* 先检查是否是数据帧ACK */
+        vtx_frame_t* data_frame = vtx_frame_queue_find(tx->data_queue,
+                                                        header.frame_id);
+        if (data_frame) {
+            vtx_frame_queue_remove(tx->data_queue, data_frame);
+            vtx_frame_release(tx->data_pool, data_frame);
+            break;
         }
+
+        /* 检查是否是I帧分片ACK */
+        vtx_spinlock_lock(&tx->iframe_lock);
+        if (tx->last_iframe && tx->last_iframe->frame_id == header.frame_id) {
+            /* 从rtx队列中移除对应的分片 */
+            vtx_frag_t *frag, *tmp;
+            list_for_each_entry_safe(frag, tmp, &tx->last_iframe->rtx, list) {
+                if (frag->frag_index == header.frag_index) {
+                    list_del(&frag->list);
+                    vtx_frag_pool_release(tx->frag_pool, frag);
+                    break;
+                }
+            }
+        }
+        vtx_spinlock_unlock(&tx->iframe_lock);
         break;
     }
 
