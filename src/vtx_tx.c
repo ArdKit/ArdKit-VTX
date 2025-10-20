@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #ifdef __APPLE__
 #include <libkern/OSByteOrder.h>
@@ -54,9 +55,9 @@ struct vtx_tx {
     vtx_frame_t*           last_iframe;      /* 最后一个I帧 */
     vtx_spinlock_t         iframe_lock;      /* I帧锁 */
 
-    /* 序列号 */
-    uint32_t               seq_num;          /* 全局序列号 */
-    uint16_t               frame_id;         /* 帧ID */
+    /* 序列号（原子操作） */
+    atomic_uint_fast32_t   seq_num;          /* 全局序列号 */
+    atomic_uint_fast16_t   frame_id;         /* 帧ID */
 
     /* 统计 */
     vtx_tx_stats_t         stats;            /* 统计信息 */
@@ -194,7 +195,7 @@ static int vtx_send_frame_frags(vtx_tx_t* tx, vtx_frame_t* frame) {
     for (uint16_t i = 0; i < total_frags; i++) {
         /* 构造包头 */
         vtx_packet_header_t header = {0};
-        header.seq_num = tx->seq_num++;
+        header.seq_num = atomic_fetch_add(&tx->seq_num, 1);
         header.frame_id = frame->frame_id;
         header.frame_type = frame->frame_type;
         header.flags = 0;
@@ -308,7 +309,7 @@ static int vtx_recv_ack(vtx_tx_t* tx) {
     } else if (header.frame_type == VTX_DATA_USER) {
         /* 数据包，发送ACK */
         vtx_packet_header_t ack_header = {0};
-        ack_header.seq_num = tx->seq_num++;
+        ack_header.seq_num = atomic_fetch_add(&tx->seq_num, 1);
         ack_header.frame_id = header.frame_id;
         ack_header.frame_type = VTX_DATA_ACK;
         vtx_send_packet(tx, &ack_header, NULL, 0);
@@ -498,7 +499,7 @@ int vtx_tx_accept(vtx_tx_t* tx, uint32_t timeout_ms) {
 
             /* 发送ACK */
             vtx_packet_header_t ack = {0};
-            ack.seq_num = tx->seq_num++;
+            ack.seq_num = atomic_fetch_add(&tx->seq_num, 1);
             ack.frame_type = VTX_DATA_ACK;
             vtx_send_packet(tx, &ack, NULL, 0);
 
@@ -559,7 +560,7 @@ int vtx_tx_send(vtx_tx_t* tx, const uint8_t* data, size_t size) {
         return VTX_ERR_NO_MEMORY;
     }
 
-    frame->frame_id = tx->frame_id++;
+    frame->frame_id = atomic_fetch_add(&tx->frame_id, 1);
     frame->frame_type = (vtx_frame_type_t)VTX_DATA_USER;
     frame->data_size = size;
     memcpy(frame->data, data, size);
@@ -567,7 +568,7 @@ int vtx_tx_send(vtx_tx_t* tx, const uint8_t* data, size_t size) {
 
     /* 发送 */
     vtx_packet_header_t header = {0};
-    header.seq_num = tx->seq_num++;
+    header.seq_num = atomic_fetch_add(&tx->seq_num, 1);
     header.frame_id = frame->frame_id;
     header.frame_type = VTX_DATA_USER;
     header.frag_index = 0;
@@ -624,7 +625,7 @@ int vtx_tx_send_media(vtx_tx_t* tx, vtx_frame_t* frame) {
     }
 
     /* 设置帧ID */
-    frame->frame_id = tx->frame_id++;
+    frame->frame_id = atomic_fetch_add(&tx->frame_id, 1);
     frame->send_time_ms = vtx_get_time_ms();
 
     /* 计算分片数量 */
@@ -640,7 +641,7 @@ int vtx_tx_send_media(vtx_tx_t* tx, vtx_frame_t* frame) {
         }
 
         vtx_packet_header_t header = {0};
-        header.seq_num = tx->seq_num++;
+        header.seq_num = atomic_fetch_add(&tx->seq_num, 1);
         header.frame_id = frame->frame_id;
         header.frame_type = frame->frame_type;
         header.frag_index = i;
@@ -701,7 +702,7 @@ int vtx_tx_close(vtx_tx_t* tx) {
     if (tx->connected) {
         /* 发送断开连接 */
         vtx_packet_header_t header = {0};
-        header.seq_num = tx->seq_num++;
+        header.seq_num = atomic_fetch_add(&tx->seq_num, 1);
         header.frame_type = VTX_DATA_DISCONNECT;
         vtx_send_packet(tx, &header, NULL, 0);
 
