@@ -130,27 +130,32 @@ static int vtx_send_packet(
         return VTX_ERR_INVALID_PARAM;
     }
 
-    /* 手工序列化header到缓冲区（避免结构体padding问题） */
-    uint8_t hdr_buf[VTX_PACKET_HEADER_MAX_SIZE];
-    uint8_t* p = hdr_buf;
+    /* 使用临时结构体进行序列化，避免手工计算偏移 */
+    vtx_packet_header_t hdr;
 
-    *(uint32_t*)p = htonl(header->seq_num); p += 4;
-    *(uint16_t*)p = htons(header->frame_id); p += 2;
-    *p++ = header->frame_type;
-    *p++ = header->flags;
-    *(uint16_t*)p = htons(header->frag_index); p += 2;
-    *(uint16_t*)p = htons(header->total_frags); p += 2;
-    *(uint16_t*)p = htons(header->payload_size); p += 2;
-    *(uint16_t*)p = 0; p += 2;  /* CRC placeholder */
+    /* 控制帧（不分片）自动设置total_frags=1 */
+    hdr.total_frags = (header->total_frags == 0) ? 1 : header->total_frags;
 
+    /* 转换为网络字节序 */
+    hdr.seq_num = htonl(header->seq_num);
+    hdr.frame_id = htons(header->frame_id);
+    hdr.frame_type = header->frame_type;
+    hdr.flags = header->flags;
+    hdr.frag_index = htons(header->frag_index);
+    hdr.total_frags = htons(hdr.total_frags);
+    hdr.payload_size = htons(header->payload_size);
+    hdr.checksum = 0;  /* CRC placeholder */
 #ifdef VTX_DEBUG
-    uint64_t ts = htobe64(header->timestamp_ms);
-    memcpy(p, &ts, 8); p += 8;
+    hdr.timestamp_ms = htobe64(header->timestamp_ms);
 #endif
 
-    int hdr_size = p - hdr_buf;
+    /* 直接memcpy结构体到缓冲区（结构体使用packed attribute，无padding） */
+    uint8_t hdr_buf[sizeof(vtx_packet_header_t)];
+    memcpy(hdr_buf, &hdr, sizeof(vtx_packet_header_t));
 
-    /* 计算并设置CRC */
+    int hdr_size = VTX_PACKET_HEADER_SIZE;
+
+    /* 计算CRC */
     uint16_t crc = vtx_packet_calc_crc(hdr_buf, payload, payload_size);
     vtx_log_debug("TX send: type=%u seq=%u crc=0x%04x size=%zu",
                  header->frame_type, header->seq_num, crc, payload_size);
@@ -312,20 +317,26 @@ static void vtx_process_retrans_queue(vtx_tx_t* tx) {
 
     /* 处理I帧分片重传 */
     vtx_spinlock_lock(&tx->iframe_lock);
-    if (tx->last_iframe) {
-        vtx_frag_t *frag, *tmp_frag;
+    if (tx->last_iframe && tx->last_iframe->retran) {
         vtx_frame_t* iframe = tx->last_iframe;
+        vtx_frag_header_t* retran = iframe->retran;
         size_t payload_capacity = tx->config.mtu - VTX_PACKET_HEADER_SIZE;
 
-        list_for_each_entry_safe(frag, tmp_frag, &iframe->rtx, list) {
+        /* 遍历所有分片，检查未ACK的分片是否需要重传 */
+        for (uint16_t i = 0; i < retran->num; i++) {
+            vtx_frag_t* frag = &retran->frag[i];
+
+            /* 跳过已ACK的分片 */
+            if (frag->received) {
+                continue;
+            }
+
             /* 检查重传次数是否超限 */
             if (frag->retrans_count >= tx->config.max_retrans) {
                 vtx_log_warn("I-frame fragment dropped: frame_id=%u, frag=%u, retrans=%u",
                            iframe->frame_id, frag->frag_index, frag->retrans_count);
-
-                /* 从队列移除并释放 */
-                list_del(&frag->list);
-                vtx_frag_pool_release(tx->frag_pool, frag);
+                /* 标记为已接收（不再重传） */
+                frag->received = true;
                 continue;
             }
 
@@ -427,7 +438,7 @@ static void vtx_process_retrans_queue(vtx_tx_t* tx) {
  * @brief 接收并处理数据包
  */
 static int vtx_recv(vtx_tx_t* tx) {
-    uint8_t buf[VTX_PACKET_HEADER_MAX_SIZE + 128];
+    uint8_t buf[sizeof(vtx_packet_header_t) + 128];
     struct sockaddr_in from_addr;
     socklen_t from_len = sizeof(from_addr);
 
@@ -486,15 +497,15 @@ static int vtx_recv(vtx_tx_t* tx) {
 
         /* 检查是否是I帧分片ACK */
         vtx_spinlock_lock(&tx->iframe_lock);
-        if (tx->last_iframe && tx->last_iframe->frame_id == header.frame_id) {
-            /* 从rtx队列中移除对应的分片 */
-            vtx_frag_t *frag, *tmp;
-            list_for_each_entry_safe(frag, tmp, &tx->last_iframe->rtx, list) {
-                if (frag->frag_index == header.frag_index) {
-                    list_del(&frag->list);
-                    vtx_frag_pool_release(tx->frag_pool, frag);
-                    break;
-                }
+        if (tx->last_iframe &&
+            tx->last_iframe->frame_id == header.frame_id &&
+            tx->last_iframe->retran) {
+            /* 标记对应分片为已ACK（不再重传） */
+            vtx_frag_header_t* retran = tx->last_iframe->retran;
+            if (header.frag_index < retran->num) {
+                retran->frag[header.frag_index].received = true;
+                vtx_log_debug("I-frame fragment ACKed: frame_id=%u, frag=%u",
+                            header.frame_id, header.frag_index);
             }
         }
         vtx_spinlock_unlock(&tx->iframe_lock);
@@ -662,7 +673,7 @@ vtx_tx_t* vtx_tx_create(
                                            VTX_MEDIA_FRAME_DATA_SIZE);
     tx->data_pool = vtx_frame_pool_create(VTX_FRAME_POOL_INIT_SIZE * 4,
                                           VTX_CTRL_FRAME_DATA_SIZE);
-    tx->frag_pool = vtx_frag_pool_create(128);  /* 默认128个分片 */
+    tx->frag_pool = vtx_frag_pool_create();
     if (!tx->media_pool || !tx->data_pool || !tx->frag_pool) {
         vtx_log_error("Failed to create frame pools");
         if (tx->media_pool) vtx_frame_pool_destroy(tx->media_pool);
@@ -749,7 +760,7 @@ int vtx_tx_accept(vtx_tx_t* tx, uint32_t timeout_ms) {
         }
 
         /* 接收数据 */
-        uint8_t buf[VTX_PACKET_HEADER_MAX_SIZE];
+        uint8_t buf[sizeof(vtx_packet_header_t)];
         struct sockaddr_in from_addr;
         socklen_t from_len = sizeof(from_addr);
 
@@ -760,18 +771,30 @@ int vtx_tx_accept(vtx_tx_t* tx, uint32_t timeout_ms) {
                 usleep(1000);  /* 1ms */
                 continue;
             }
-            vtx_log_error("recvfrom failed: %s", strerror(errno));
+            vtx_log_error("recvfrom failed: %s (errno=%d)", strerror(errno), errno);
             return VTX_ERR_SOCKET_RECV;
         }
 
+        vtx_log_debug("vtx_tx_accept: received %zd bytes from %s:%d",
+                     n, inet_ntoa(from_addr.sin_addr), ntohs(from_addr.sin_port));
+
+        vtx_log_debug("vtx_tx_accept: size check: n=%zd, VTX_PACKET_HEADER_SIZE=%zu",
+                     n, sizeof(vtx_packet_header_t));
+
         if (n < VTX_PACKET_HEADER_SIZE) {
+            vtx_log_debug("vtx_tx_accept: packet too small, continuing...");
             continue;
         }
+
+        vtx_log_debug("vtx_tx_accept: packet size OK, deserializing...");
 
         /* 反序列化 */
         vtx_packet_header_t header;
         memcpy(&header, buf, sizeof(header));
         vtx_packet_deserialize_header(&header);
+
+        vtx_log_debug("vtx_tx_accept: deserialized frame_type=0x%02x (CONNECT=0x%02x)",
+                     header.frame_type, VTX_DATA_CONNECT);
 
         /* 检查是否为连接请求 */
         if (header.frame_type == VTX_DATA_CONNECT) {
@@ -779,15 +802,18 @@ int vtx_tx_accept(vtx_tx_t* tx, uint32_t timeout_ms) {
             tx->client_addr_len = from_len;
             tx->connected = true;
 
-            vtx_log_info("Client connected from %s:%d",
+            vtx_log_info("Client connected from %s:%d (saved addr family=%d, len=%d)",
                         inet_ntoa(from_addr.sin_addr),
-                        ntohs(from_addr.sin_port));
+                        ntohs(from_addr.sin_port),
+                        from_addr.sin_family,
+                        from_len);
 
-            /* 发送ACK */
-            vtx_packet_header_t ack = {0};
-            ack.seq_num = atomic_fetch_add(&tx->seq_num, 1);
-            ack.frame_type = VTX_DATA_ACK;
-            vtx_send_packet(tx, &ack, NULL, 0);
+            /* 发送CONNECTED完成3次握手 */
+            vtx_packet_header_t connected = {0};
+            connected.seq_num = atomic_fetch_add(&tx->seq_num, 1);
+            connected.frame_type = VTX_DATA_CONNECTED;
+            connected.total_frags = 1;  /* 控制帧为单包 */
+            vtx_send_packet(tx, &connected, NULL, 0);
 
             return VTX_OK;
         }
@@ -925,8 +951,20 @@ int vtx_tx_send_media(vtx_tx_t* tx, vtx_frame_t* frame) {
     /* 计算分片数量 */
     size_t payload_capacity = tx->config.mtu - VTX_PACKET_HEADER_SIZE;
     uint16_t total_frags = (frame->data_size + payload_capacity - 1) / payload_capacity;
+    frame->total_frags = total_frags;
+
+    /* 对于I帧，预先分配retran用于重传跟踪 */
+    if (frame->frame_type == VTX_FRAME_I) {
+        frame->retran = vtx_frag_pool_acquire(tx->frag_pool, total_frags);
+        if (!frame->retran) {
+            vtx_log_error("Failed to allocate retran for I-frame with %u frags", total_frags);
+            vtx_frame_release(tx->media_pool, frame);
+            return VTX_ERR_NO_MEMORY;
+        }
+    }
 
     /* 发送所有分片 */
+    uint64_t send_time_ms = vtx_get_time_ms();
     for (uint16_t i = 0; i < total_frags; i++) {
         size_t offset = i * payload_capacity;
         size_t payload_size = frame->data_size - offset;
@@ -949,21 +987,23 @@ int vtx_tx_send_media(vtx_tx_t* tx, vtx_frame_t* frame) {
         int ret = vtx_send_packet(tx, &header, frame->data + offset, payload_size);
         if (ret != VTX_OK) {
             vtx_log_error("Failed to send media fragment %u/%u", i + 1, total_frags);
+            /* 如果已分配retran，需要释放 */
+            if (frame->retran) {
+                vtx_frag_pool_release(tx->frag_pool, frame->retran);
+                frame->retran = NULL;
+            }
             vtx_frame_release(tx->media_pool, frame);
             return ret;
         }
 
-        /* 对于I帧，添加分片到重传队列 */
-        if (frame->frame_type == VTX_FRAME_I) {
-            vtx_frag_t* frag = vtx_frag_pool_acquire(tx->frag_pool);
-            if (frag) {
-                frag->frag_index = i;
-                frag->seq_num = header.seq_num;
-                frag->retrans_count = 0;
-                frag->send_time_ms = vtx_get_time_ms();
-                frag->received = false;
-                list_add_tail(&frag->list, &frame->rtx);
-            }
+        /* 对于I帧，配置retran中的分片信息 */
+        if (frame->frame_type == VTX_FRAME_I && frame->retran) {
+            vtx_frag_t* frag = &frame->retran->frag[i];
+            frag->frag_index = i;
+            frag->seq_num = header.seq_num;
+            frag->retrans_count = 0;
+            frag->send_time_ms = send_time_ms;
+            frag->received = false;  /* 尚未ACK */
         }
     }
 
@@ -973,11 +1013,10 @@ int vtx_tx_send_media(vtx_tx_t* tx, vtx_frame_t* frame) {
 
         /* 释放旧的I帧 */
         if (tx->last_iframe) {
-            /* 清理旧I帧的rtx队列 */
-            vtx_frag_t *frag, *tmp;
-            list_for_each_entry_safe(frag, tmp, &tx->last_iframe->rtx, list) {
-                list_del(&frag->list);
-                vtx_frag_pool_release(tx->frag_pool, frag);
+            /* 释放旧I帧的retran */
+            if (tx->last_iframe->retran) {
+                vtx_frag_pool_release(tx->frag_pool, tx->last_iframe->retran);
+                tx->last_iframe->retran = NULL;
             }
             vtx_frame_release(tx->media_pool, tx->last_iframe);
         }
@@ -1052,13 +1091,10 @@ void vtx_tx_destroy(vtx_tx_t* tx) {
     /* 释放I帧 */
     vtx_spinlock_lock(&tx->iframe_lock);
     if (tx->last_iframe) {
-        /* 清理rtx队列 */
-        if (tx->frag_pool) {
-            vtx_frag_t *frag, *tmp;
-            list_for_each_entry_safe(frag, tmp, &tx->last_iframe->rtx, list) {
-                list_del(&frag->list);
-                vtx_frag_pool_release(tx->frag_pool, frag);
-            }
+        /* 释放retran */
+        if (tx->last_iframe->retran && tx->frag_pool) {
+            vtx_frag_pool_release(tx->frag_pool, tx->last_iframe->retran);
+            tx->last_iframe->retran = NULL;
         }
         vtx_frame_release(tx->media_pool, tx->last_iframe);
         tx->last_iframe = NULL;

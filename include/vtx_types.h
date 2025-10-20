@@ -53,15 +53,6 @@ typedef enum {
 
 /* ========== 数据包结构 ========== */
 
-/* 包头大小常量（先定义，后续结构体使用） */
-#ifdef VTX_DEBUG
-#define VTX_PACKET_HEADER_SIZE 22
-#else
-#define VTX_PACKET_HEADER_SIZE 14
-#endif
-
-#define VTX_PACKET_HEADER_MAX_SIZE 22
-
 /**
  * @brief VTX数据包头部
  *
@@ -80,7 +71,10 @@ typedef struct {
 #ifdef VTX_DEBUG
     uint64_t timestamp_ms;   /* 发送时间戳（仅DEBUG模式，用于延迟测量） */
 #endif
-} vtx_packet_header_t;
+} __attribute__((packed)) vtx_packet_header_t;
+
+/* 包头大小 - 使用sizeof自动计算 */
+#define VTX_PACKET_HEADER_SIZE sizeof(vtx_packet_header_t)
 
 /* ========== 配置结构 ========== */
 

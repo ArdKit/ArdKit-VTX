@@ -127,25 +127,30 @@ static int vtx_send_packet(
         return VTX_ERR_INVALID_PARAM;
     }
 
-    /* 手工序列化header到缓冲区（避免结构体padding问题） */
-    uint8_t hdr_buf[VTX_PACKET_HEADER_MAX_SIZE];
-    uint8_t* p = hdr_buf;
+    /* 使用临时结构体进行序列化，避免手工计算偏移 */
+    vtx_packet_header_t hdr;
 
-    *(uint32_t*)p = htonl(header->seq_num); p += 4;
-    *(uint16_t*)p = htons(header->frame_id); p += 2;
-    *p++ = header->frame_type;
-    *p++ = header->flags;
-    *(uint16_t*)p = htons(header->frag_index); p += 2;
-    *(uint16_t*)p = htons(header->total_frags); p += 2;
-    *(uint16_t*)p = htons(header->payload_size); p += 2;
-    *(uint16_t*)p = 0; p += 2;  /* CRC placeholder */
+    /* 控制帧（不分片）自动设置total_frags=1 */
+    hdr.total_frags = (header->total_frags == 0) ? 1 : header->total_frags;
 
+    /* 转换为网络字节序 */
+    hdr.seq_num = htonl(header->seq_num);
+    hdr.frame_id = htons(header->frame_id);
+    hdr.frame_type = header->frame_type;
+    hdr.flags = header->flags;
+    hdr.frag_index = htons(header->frag_index);
+    hdr.total_frags = htons(hdr.total_frags);
+    hdr.payload_size = htons(header->payload_size);
+    hdr.checksum = 0;  /* CRC placeholder */
 #ifdef VTX_DEBUG
-    uint64_t ts = htobe64(header->timestamp_ms);
-    memcpy(p, &ts, 8); p += 8;
+    hdr.timestamp_ms = htobe64(header->timestamp_ms);
 #endif
 
-    int hdr_size = p - hdr_buf;
+    /* 直接memcpy结构体到缓冲区（结构体使用packed attribute，无padding） */
+    uint8_t hdr_buf[sizeof(vtx_packet_header_t)];
+    memcpy(hdr_buf, &hdr, sizeof(vtx_packet_header_t));
+
+    int hdr_size = VTX_PACKET_HEADER_SIZE;
 
     /* 计算CRC */
     vtx_packet_calc_crc(hdr_buf, payload, payload_size);
@@ -163,14 +168,22 @@ static int vtx_send_packet(
     msg.msg_iov = iov;
     msg.msg_iovlen = payload_size > 0 ? 2 : 1;
 
+    vtx_log_debug("RX sending on sockfd=%d to %s:%d",
+                  rx->sockfd,
+                  inet_ntoa(rx->server_addr.sin_addr),
+                  ntohs(rx->server_addr.sin_port));
+
     ssize_t sent = sendmsg(rx->sockfd, &msg, 0);
     if (sent < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            vtx_log_error("vtx_send_packet: EAGAIN/EWOULDBLOCK");
             return VTX_ERR_BUSY;
         }
+        vtx_log_error("vtx_send_packet: send error, errno=%d", errno);
         return VTX_ERR_SOCKET_SEND;
     }
 
+    vtx_log_debug("vtx_send_packet: sent %zd bytes", sent);
     return VTX_OK;
 }
 
@@ -208,7 +221,8 @@ static int vtx_handle_fragment(
         }
 
         /* 初始化 */
-        int ret = vtx_frame_init_recv(frame, header->frame_id,
+        int ret = vtx_frame_init_recv(frame, rx->frag_pool,
+                                      header->frame_id,
                                       header->frame_type,
                                       header->total_frags);
         if (ret != VTX_OK) {
@@ -262,8 +276,17 @@ static int vtx_handle_fragment(
 
     /* 检查是否完整 */
     if (vtx_frame_is_complete(frame)) {
-        /* 从接收队列移除 */
+        /* Retain frame以防止在调用回调前被释放 */
+        vtx_frame_t* complete_frame = vtx_frame_retain(frame);
+
+        /* 从接收队列移除（内部会release） */
         vtx_frame_queue_remove(rx->recv_queue, frame);
+
+        /* 释放retran（RX端已完成接收，不再需要跟踪） */
+        if (complete_frame->retran) {
+            vtx_frag_pool_release(rx->frag_pool, complete_frame->retran);
+            complete_frame->retran = NULL;
+        }
 
         /* 如果是I帧，缓存 */
         if (header->frame_type == VTX_FRAME_I) {
@@ -271,28 +294,31 @@ static int vtx_handle_fragment(
             if (rx->last_iframe) {
                 vtx_frame_release(rx->media_pool, rx->last_iframe);
             }
-            rx->last_iframe = vtx_frame_retain(frame);
+            rx->last_iframe = vtx_frame_retain(complete_frame);
             vtx_spinlock_unlock(&rx->iframe_lock);
         }
 
         /* 调用回调 */
         if (rx->frame_fn) {
-            rx->frame_fn(frame->data, frame->data_size,
-                        frame->frame_type, rx->userdata);
+            rx->frame_fn(complete_frame->data, complete_frame->data_size,
+                        complete_frame->frame_type, rx->userdata);
         }
 
         /* 更新统计 */
         vtx_spinlock_lock(&rx->stats_lock);
         rx->stats.total_frames++;
-        if (frame->frame_type == VTX_FRAME_I) {
+        if (complete_frame->frame_type == VTX_FRAME_I) {
             rx->stats.total_i_frames++;
-        } else if (frame->frame_type == VTX_FRAME_P) {
+        } else if (complete_frame->frame_type == VTX_FRAME_P) {
             rx->stats.total_p_frames++;
         }
         vtx_spinlock_unlock(&rx->stats_lock);
 
         vtx_log_debug("Frame complete: id=%u type=%u size=%zu",
-                     frame->frame_id, frame->frame_type, frame->data_size);
+                     complete_frame->frame_id, complete_frame->frame_type, complete_frame->data_size);
+
+        /* 释放我们的引用 */
+        vtx_frame_release(rx->media_pool, complete_frame);
     }
 
     return VTX_OK;
@@ -549,7 +575,7 @@ vtx_rx_t* vtx_rx_create(
                                            VTX_MEDIA_FRAME_DATA_SIZE);
     rx->data_pool = vtx_frame_pool_create(VTX_FRAME_POOL_INIT_SIZE * 4,
                                           VTX_CTRL_FRAME_DATA_SIZE);
-    rx->frag_pool = vtx_frag_pool_create(128);  /* 默认128个分片 */
+    rx->frag_pool = vtx_frag_pool_create();
     if (!rx->media_pool || !rx->data_pool || !rx->frag_pool) {
         vtx_log_error("Failed to create frame pools");
         if (rx->media_pool) vtx_frame_pool_destroy(rx->media_pool);
@@ -609,28 +635,11 @@ int vtx_rx_connect(vtx_rx_t* rx) {
         return ret;
     }
 
-    vtx_log_info("Connecting to %s:%u...",
-                inet_ntoa(rx->server_addr.sin_addr),
-                ntohs(rx->server_addr.sin_port));
+    vtx_log_info("Sent CONNECT to server");
 
-    /* 等待ACK */
-    uint64_t start_ms = vtx_get_time_ms();
-    while (vtx_get_time_ms() - start_ms < 5000) {  /* 5秒超时 */
-        ret = vtx_recv_packet(rx);
-        if (ret > 0) {
-            /* 检查是否收到ACK */
-            rx->connected = true;
-            if (rx->connect_fn) {
-                rx->connect_fn(true, rx->userdata);
-            }
-            vtx_log_info("Connected successfully");
-            return VTX_OK;
-        }
-        usleep(1000);  /* 1ms */
-    }
-
-    vtx_log_error("Connection timeout");
-    return VTX_ERR_TIMEOUT;
+    /* 不在这里等待响应，让poll线程接收CONNECTED响应
+     * 连接状态变化会通过connect_fn回调通知应用层 */
+    return VTX_OK;
 }
 
 int vtx_rx_poll(vtx_rx_t* rx, uint32_t timeout_ms) {
@@ -649,6 +658,14 @@ int vtx_rx_poll(vtx_rx_t* rx, uint32_t timeout_ms) {
 
     int ret = select(rx->sockfd + 1, &readfds, NULL, NULL,
                     timeout_ms > 0 ? &tv : NULL);
+
+    static int first_time = 1;
+    if (first_time) {
+        vtx_log_info("RX poll using sockfd=%d", rx->sockfd);
+        first_time = 0;
+    }
+    vtx_log_debug("select returned %d", ret);
+
     if (ret < 0) {
         if (errno == EINTR) {
             return 0;

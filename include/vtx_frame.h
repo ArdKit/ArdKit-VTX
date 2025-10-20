@@ -59,13 +59,27 @@ typedef enum {
  * - 支持细粒度的重传控制
  */
 typedef struct vtx_frag {
-    struct list_head list;           /* 链表节点（用于重传队列） */
     uint16_t         frag_index;     /* 分片索引 */
     bool             received;       /* 是否已接收（RX端使用） */
     uint8_t          retrans_count;  /* 重传次数 */
     uint64_t         send_time_ms;   /* 发送时间（用于重传超时） */
     uint32_t         seq_num;        /* 该分片的序列号 */
 } vtx_frag_t;
+
+/**
+ * @brief 分片头结构（slab分配管理）
+ *
+ * 设计说明：
+ * - 用于批量分配多个分片
+ * - 使用slab allocator模式
+ * - 支持1, 32, 128, 256, 512个分片的固定大小分配
+ */
+typedef struct vtx_frag_header {
+    struct list_head list;           /* 链表节点（用于slab管理） */
+    uint16_t         capacity;       /* 容量（最多可容纳的分片数） */
+    uint16_t         num;            /* 实际分片数量 */
+    vtx_frag_t       frag[0];        /* 柔性数组：分片数据 */
+} vtx_frag_header_t;
 
 /* ========== 帧结构（统一frame和pkg） ========== */
 
@@ -97,11 +111,8 @@ typedef struct vtx_frame {
     uint64_t         send_time_ms;   /* 发送时间（用于重传超时） */
     uint8_t          retrans_count;  /* 重传次数 */
 
-    /* 重传队列（细粒度分片管理） */
-    struct list_head rtx;            /* 重传队列（vtx_frag_t链表） */
-
-    /* 分片接收bitmap（RX端使用，动态分配） */
-    uint8_t*         bitmap;         /* 分片接收位图 */
+    /* 重传管理（slab分配的分片数组） */
+    vtx_frag_header_t* retran;       /* 重传分片头（NULL表示无重传） */
 
     /* 帧数据（动态分配） */
     uint8_t*         data;           /* 帧数据缓冲区指针 */
@@ -183,16 +194,15 @@ void vtx_frame_pool_release(vtx_frame_pool_t* pool, vtx_frame_t* frame);
 typedef struct vtx_frag_pool vtx_frag_pool_t;
 
 /**
- * @brief 创建分片内存池
+ * @brief 创建分片内存池（slab allocator）
  *
- * @param initial_size 初始frag数量
  * @return vtx_frag_pool_t* 成功返回内存池对象，失败返回NULL
  *
  * 注意：
- * - 预分配initial_size个frag
- * - 内存池可按需动态扩展
+ * - 支持1, 32, 128, 256, 512个分片的slab
+ * - 按需动态分配slab
  */
-vtx_frag_pool_t* vtx_frag_pool_create(size_t initial_size);
+vtx_frag_pool_t* vtx_frag_pool_create(void);
 
 /**
  * @brief 销毁分片内存池
@@ -200,34 +210,35 @@ vtx_frag_pool_t* vtx_frag_pool_create(size_t initial_size);
  * @param pool 内存池对象
  *
  * 注意：
- * - 释放所有frag（包括正在使用的）
- * - 如果有frag仍被使用，会打印警告（DEBUG模式）
+ * - 释放所有slab（包括正在使用的）
+ * - 如果有slab仍被使用，会打印警告（DEBUG模式）
  */
 void vtx_frag_pool_destroy(vtx_frag_pool_t* pool);
 
 /**
- * @brief 从池中获取frag
+ * @brief 从池中分配frag_header
  *
  * @param pool 内存池对象
- * @return vtx_frag_t* 成功返回frag，失败返回NULL
+ * @param num_frags 需要的分片数量
+ * @return vtx_frag_header_t* 成功返回frag_header，失败返回NULL
  *
  * 注意：
- * - 如果池为空，自动分配新frag
- * - 返回的frag已初始化为0
+ * - 根据num_frags向上取整到1, 32, 128, 256, 512
+ * - 返回的frag_header已初始化，num设置为num_frags
  * - 使用完毕后需调用vtx_frag_pool_release释放
  */
-vtx_frag_t* vtx_frag_pool_acquire(vtx_frag_pool_t* pool);
+vtx_frag_header_t* vtx_frag_pool_acquire(vtx_frag_pool_t* pool, uint16_t num_frags);
 
 /**
- * @brief 归还frag到池中
+ * @brief 归还frag_header到池中
  *
  * @param pool 内存池对象
- * @param frag frag对象
+ * @param header frag_header对象
  *
  * 注意：
- * - frag会被重置后归还到池中
+ * - frag_header会被重置后归还到对应capacity的池中
  */
-void vtx_frag_pool_release(vtx_frag_pool_t* pool, vtx_frag_t* frag);
+void vtx_frag_pool_release(vtx_frag_pool_t* pool, vtx_frag_header_t* header);
 
 /* ========== frame引用计数 ========== */
 
@@ -359,18 +370,20 @@ size_t vtx_frame_copyto(
  * @brief 初始化frame用于接收
  *
  * @param frame frame对象
+ * @param frag_pool 分片池（用于分配retran）
  * @param frame_id 帧ID
  * @param frame_type 帧类型
  * @param total_frags 总分片数
  * @return 0成功，负数表示错误码
  *
  * 注意：
- * - 自动分配bitmap
+ * - 从frag_pool分配retran用于跟踪接收状态
  * - 重置recv_frags和data_size
  * - 设置状态为RECEIVING
  */
 int vtx_frame_init_recv(
     vtx_frame_t* frame,
+    vtx_frag_pool_t* frag_pool,
     uint16_t frame_id,
     vtx_frame_type_t frame_type,
     uint16_t total_frags);

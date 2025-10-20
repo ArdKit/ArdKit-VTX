@@ -31,14 +31,23 @@ struct vtx_frame_pool {
 /**
  * @brief 分片内存池完整定义
  */
+/* Slab大小常量 */
+#define VTX_FRAG_SLAB_SIZE_1    1
+#define VTX_FRAG_SLAB_SIZE_32   32
+#define VTX_FRAG_SLAB_SIZE_128  128
+#define VTX_FRAG_SLAB_SIZE_256  256
+#define VTX_FRAG_SLAB_SIZE_512  512
+#define VTX_FRAG_SLAB_COUNT     5
+
+/* Slab池结构 */
 struct vtx_frag_pool {
-    struct list_head   free_list;    /* 空闲frag链表 */
-    size_t             free_count;   /* 空闲frag数量 */
-    size_t             total_count;  /* 总frag数量 */
+    struct list_head   slab_free[VTX_FRAG_SLAB_COUNT];  /* 各大小的空闲slab链表 */
+    size_t             slab_free_count[VTX_FRAG_SLAB_COUNT];  /* 各大小的空闲数量 */
+    size_t             slab_total_count[VTX_FRAG_SLAB_COUNT]; /* 各大小的总数量 */
+    uint16_t           slab_sizes[VTX_FRAG_SLAB_COUNT];  /* slab大小数组 */
     vtx_spinlock_t     lock;         /* 自旋锁 */
 
     /* 统计信息 */
-    size_t             peak_count;   /* 峰值使用数量 */
     size_t             total_allocs; /* 总分配次数 */
     size_t             total_frees;  /* 总释放次数 */
 };
@@ -77,12 +86,11 @@ static vtx_frame_t* vtx_frame_alloc(size_t data_size) {
 
     /* 初始化frame */
     INIT_LIST_HEAD(&frame->list);
-    INIT_LIST_HEAD(&frame->rtx);
     atomic_init(&frame->refcount, 0);
     frame->state = VTX_FRAME_STATE_FREE;
     frame->data_capacity = data_size;
+    frame->retran = NULL;
     frame->data_size = 0;
-    frame->bitmap = NULL;
 
     return frame;
 }
@@ -97,10 +105,11 @@ static void vtx_frame_free(vtx_frame_t* frame) {
         return;
     }
 
-    /* 释放bitmap */
-    if (frame->bitmap) {
-        vtx_free(frame->bitmap);
-        frame->bitmap = NULL;
+    /* 释放retran（如果有的话，应该已在reset中释放） */
+    if (frame->retran) {
+        vtx_log_warn("Frame being freed still has retran allocated");
+        vtx_free(frame->retran);
+        frame->retran = NULL;
     }
 
     /* 释放数据缓冲区 */
@@ -244,33 +253,52 @@ void vtx_frame_pool_release(vtx_frame_pool_t* pool, vtx_frame_t* frame) {
 
 /* ========== 分片池管理 ========== */
 
-vtx_frag_pool_t* vtx_frag_pool_create(size_t initial_size) {
+/**
+ * @brief 将num_frags向上取整到slab大小
+ *
+ * @param num_frags 实际需要的分片数
+ * @return int slab索引，-1表示超出范围
+ */
+static int vtx_frag_get_slab_index(uint16_t num_frags) {
+    if (num_frags <= VTX_FRAG_SLAB_SIZE_1) {
+        return 0;
+    } else if (num_frags <= VTX_FRAG_SLAB_SIZE_32) {
+        return 1;
+    } else if (num_frags <= VTX_FRAG_SLAB_SIZE_128) {
+        return 2;
+    } else if (num_frags <= VTX_FRAG_SLAB_SIZE_256) {
+        return 3;
+    } else if (num_frags <= VTX_FRAG_SLAB_SIZE_512) {
+        return 4;
+    } else {
+        return -1;  /* 超出最大支持 */
+    }
+}
+
+vtx_frag_pool_t* vtx_frag_pool_create(void) {
     vtx_frag_pool_t* pool = (vtx_frag_pool_t*)vtx_calloc(1, sizeof(vtx_frag_pool_t));
     if (!pool) {
         vtx_log_error("Failed to allocate frag pool");
         return NULL;
     }
 
-    /* 初始化链表和锁 */
-    INIT_LIST_HEAD(&pool->free_list);
-    vtx_spinlock_init(&pool->lock);
+    /* 初始化slab大小数组 */
+    pool->slab_sizes[0] = VTX_FRAG_SLAB_SIZE_1;
+    pool->slab_sizes[1] = VTX_FRAG_SLAB_SIZE_32;
+    pool->slab_sizes[2] = VTX_FRAG_SLAB_SIZE_128;
+    pool->slab_sizes[3] = VTX_FRAG_SLAB_SIZE_256;
+    pool->slab_sizes[4] = VTX_FRAG_SLAB_SIZE_512;
 
-    /* 预分配frag */
-    for (size_t i = 0; i < initial_size; i++) {
-        vtx_frag_t* frag = (vtx_frag_t*)vtx_calloc(1, sizeof(vtx_frag_t));
-        if (!frag) {
-            vtx_log_error("Failed to allocate frag");
-            vtx_frag_pool_destroy(pool);
-            return NULL;
-        }
-
-        INIT_LIST_HEAD(&frag->list);
-        list_add_tail(&frag->list, &pool->free_list);
-        pool->free_count++;
-        pool->total_count++;
+    /* 初始化各slab的空闲链表 */
+    for (int i = 0; i < VTX_FRAG_SLAB_COUNT; i++) {
+        INIT_LIST_HEAD(&pool->slab_free[i]);
+        pool->slab_free_count[i] = 0;
+        pool->slab_total_count[i] = 0;
     }
 
-    vtx_log_info("Frag pool created: initial=%zu", initial_size);
+    vtx_spinlock_init(&pool->lock);
+
+    vtx_log_info("Frag pool created with slab sizes: 1, 32, 128, 256, 512");
 
     return pool;
 }
@@ -280,90 +308,116 @@ void vtx_frag_pool_destroy(vtx_frag_pool_t* pool) {
         return;
     }
 
-    /* 释放所有frag */
     vtx_spinlock_lock(&pool->lock);
-    vtx_frag_t* frag;
-    vtx_frag_t* tmp;
-    size_t leaked = 0;
 
-    list_for_each_entry_safe(frag, tmp, &pool->free_list, list) {
-        list_del(&frag->list);
-        vtx_free(frag);
-    }
+    size_t total_leaked = 0;
 
-    leaked = pool->total_count - pool->free_count;
-    if (leaked > 0) {
-        vtx_log_warn("Frag pool destroyed: leaked=%zu", leaked);
+    /* 释放所有slab */
+    for (int i = 0; i < VTX_FRAG_SLAB_COUNT; i++) {
+        vtx_frag_header_t* header;
+        vtx_frag_header_t* tmp;
+
+        list_for_each_entry_safe(header, tmp, &pool->slab_free[i], list) {
+            list_del(&header->list);
+            vtx_free(header);
+        }
+
+        size_t leaked = pool->slab_total_count[i] - pool->slab_free_count[i];
+        total_leaked += leaked;
+
+        if (leaked > 0) {
+            vtx_log_warn("Frag pool slab[%d] (size=%u): leaked=%zu",
+                        i, pool->slab_sizes[i], leaked);
+        }
     }
 
     vtx_spinlock_unlock(&pool->lock);
-
     vtx_spinlock_destroy(&pool->lock);
 
-    vtx_log_info("Frag pool destroyed: total=%zu, leaked=%zu",
-                pool->total_count, leaked);
+    vtx_log_info("Frag pool destroyed: total_allocs=%zu, total_frees=%zu, leaked=%zu",
+                pool->total_allocs, pool->total_frees, total_leaked);
 
     vtx_free(pool);
 }
 
-vtx_frag_t* vtx_frag_pool_acquire(vtx_frag_pool_t* pool) {
-    if (!pool) {
+vtx_frag_header_t* vtx_frag_pool_acquire(vtx_frag_pool_t* pool, uint16_t num_frags) {
+    if (!pool || num_frags == 0) {
         return NULL;
     }
 
+    /* 确定slab索引 */
+    int slab_idx = vtx_frag_get_slab_index(num_frags);
+    if (slab_idx < 0) {
+        vtx_log_error("num_frags %u exceeds max slab size %u",
+                     num_frags, VTX_FRAG_SLAB_SIZE_512);
+        return NULL;
+    }
+
+    uint16_t capacity = pool->slab_sizes[slab_idx];
+
     vtx_spinlock_lock(&pool->lock);
 
-    vtx_frag_t* frag = NULL;
+    vtx_frag_header_t* header = NULL;
 
-    if (!list_empty(&pool->free_list)) {
-        /* 从空闲链表获取 */
-        frag = list_first_entry(&pool->free_list, vtx_frag_t, list);
-        list_del(&frag->list);
-        pool->free_count--;
+    /* 尝试从空闲链表获取 */
+    if (!list_empty(&pool->slab_free[slab_idx])) {
+        header = list_first_entry(&pool->slab_free[slab_idx],
+                                  vtx_frag_header_t, list);
+        list_del(&header->list);
+        pool->slab_free_count[slab_idx]--;
     } else {
-        /* 池为空，动态分配 */
+        /* 空闲链表为空，分配新slab */
         vtx_spinlock_unlock(&pool->lock);
 
-        frag = (vtx_frag_t*)vtx_calloc(1, sizeof(vtx_frag_t));
-        if (!frag) {
-            vtx_log_error("Failed to allocate frag");
+        size_t alloc_size = sizeof(vtx_frag_header_t) + capacity * sizeof(vtx_frag_t);
+        header = (vtx_frag_header_t*)vtx_malloc(alloc_size);
+        if (!header) {
+            vtx_log_error("Failed to allocate frag slab: size=%zu", alloc_size);
             return NULL;
         }
 
-        INIT_LIST_HEAD(&frag->list);
-
         vtx_spinlock_lock(&pool->lock);
-        pool->total_count++;
+        pool->slab_total_count[slab_idx]++;
     }
 
     pool->total_allocs++;
-    size_t used = pool->total_count - pool->free_count;
-    if (used > pool->peak_count) {
-        pool->peak_count = used;
-    }
 
     vtx_spinlock_unlock(&pool->lock);
 
-    /* 初始化frag */
-    memset(frag, 0, sizeof(vtx_frag_t));
-    INIT_LIST_HEAD(&frag->list);
+    /* 初始化header */
+    INIT_LIST_HEAD(&header->list);
+    header->capacity = capacity;
+    header->num = num_frags;
 
-    return frag;
+    /* 清零所有frags */
+    memset(header->frag, 0, capacity * sizeof(vtx_frag_t));
+
+    return header;
 }
 
-void vtx_frag_pool_release(vtx_frag_pool_t* pool, vtx_frag_t* frag) {
-    if (!pool || !frag) {
+void vtx_frag_pool_release(vtx_frag_pool_t* pool, vtx_frag_header_t* header) {
+    if (!pool || !header) {
         return;
     }
 
-    /* 重置frag */
-    memset(frag, 0, sizeof(vtx_frag_t));
-    INIT_LIST_HEAD(&frag->list);
+    uint16_t capacity = header->capacity;
 
-    /* 归还到空闲链表 */
+    /* 确定slab索引 */
+    int slab_idx = vtx_frag_get_slab_index(capacity);
+    if (slab_idx < 0 || pool->slab_sizes[slab_idx] != capacity) {
+        vtx_log_error("Invalid frag header capacity: %u", capacity);
+        vtx_free(header);
+        return;
+    }
+
+    /* 清零header */
+    memset(header, 0, sizeof(vtx_frag_header_t) + capacity * sizeof(vtx_frag_t));
+
+    /* 归还到对应slab的空闲链表 */
     vtx_spinlock_lock(&pool->lock);
-    list_add_tail(&frag->list, &pool->free_list);
-    pool->free_count++;
+    INIT_LIST_HEAD(&header->list);
+    list_add_tail(&header->list, &pool->slab_free[slab_idx]);
+    pool->slab_free_count[slab_idx]++;
     pool->total_frees++;
     vtx_spinlock_unlock(&pool->lock);
 }
@@ -485,11 +539,12 @@ size_t vtx_frame_copyto(
 
 int vtx_frame_init_recv(
     vtx_frame_t* frame,
+    vtx_frag_pool_t* frag_pool,
     uint16_t frame_id,
     vtx_frame_type_t frame_type,
     uint16_t total_frags)
 {
-    if (!frame || total_frags == 0) {
+    if (!frame || !frag_pool || total_frags == 0) {
         return VTX_ERR_INVALID_PARAM;
     }
 
@@ -502,12 +557,20 @@ int vtx_frame_init_recv(
     frame->state = VTX_FRAME_STATE_RECEIVING;
     frame->retrans_count = 0;
 
-    /* 分配bitmap */
-    size_t bitmap_size = (total_frags + 7) / 8;
-    frame->bitmap = (uint8_t*)vtx_calloc(1, bitmap_size);
-    if (!frame->bitmap) {
-        vtx_log_error("Failed to allocate bitmap: %zu bytes", bitmap_size);
+    /* 从frag_pool分配retran用于跟踪接收状态 */
+    frame->retran = vtx_frag_pool_acquire(frag_pool, total_frags);
+    if (!frame->retran) {
+        vtx_log_error("Failed to allocate retran for %u frags", total_frags);
         return VTX_ERR_NO_MEMORY;
+    }
+
+    /* 初始化所有frags为未接收状态 */
+    for (uint16_t i = 0; i < total_frags; i++) {
+        frame->retran->frag[i].frag_index = i;
+        frame->retran->frag[i].received = false;
+        frame->retran->frag[i].retrans_count = 0;
+        frame->retran->frag[i].send_time_ms = 0;
+        frame->retran->frag[i].seq_num = 0;
     }
 
     /* 记录时间戳 */
@@ -525,13 +588,11 @@ bool vtx_frame_is_complete(const vtx_frame_t* frame) {
 }
 
 bool vtx_frame_has_frag(const vtx_frame_t* frame, uint16_t frag_index) {
-    if (!frame || !frame->bitmap || frag_index >= frame->total_frags) {
+    if (!frame || !frame->retran || frag_index >= frame->total_frags) {
         return false;
     }
 
-    size_t byte_idx = frag_index / 8;
-    size_t bit_idx = frag_index % 8;
-    return (frame->bitmap[byte_idx] & (1 << bit_idx)) != 0;
+    return frame->retran->frag[frag_index].received;
 }
 
 size_t vtx_frame_get_missing_frags(
@@ -557,7 +618,7 @@ size_t vtx_frame_get_missing_frags(
 }
 
 int vtx_frame_mark_frag_received(vtx_frame_t* frame, uint16_t frag_index) {
-    if (!frame || !frame->bitmap) {
+    if (!frame || !frame->retran) {
         return VTX_ERR_INVALID_PARAM;
     }
 
@@ -566,14 +627,12 @@ int vtx_frame_mark_frag_received(vtx_frame_t* frame, uint16_t frag_index) {
     }
 
     /* 检查是否已接收 */
-    if (vtx_frame_has_frag(frame, frag_index)) {
+    if (frame->retran->frag[frag_index].received) {
         return VTX_OK;  /* 重复分片，忽略 */
     }
 
-    /* 标记bitmap */
-    size_t byte_idx = frag_index / 8;
-    size_t bit_idx = frag_index % 8;
-    frame->bitmap[byte_idx] |= (1 << bit_idx);
+    /* 标记为已接收 */
+    frame->retran->frag[frag_index].received = true;
 
     /* 更新计数和时间戳 */
     frame->recv_frags++;
@@ -592,14 +651,12 @@ void vtx_frame_reset(vtx_frame_t* frame) {
         return;
     }
 
-    /* 释放bitmap */
-    if (frame->bitmap) {
-        vtx_free(frame->bitmap);
-        frame->bitmap = NULL;
+    /* 释放retran（注意：调用者应在此之前通过frag_pool释放retran） */
+    if (frame->retran) {
+        vtx_log_warn("Frame reset with retran still allocated - caller should release to pool first");
+        /* 这里不释放，因为应该由调用者通过vtx_frag_pool_release归还 */
+        frame->retran = NULL;
     }
-
-    /* 重置rtx队列（注意：调用者应在此之前清理rtx中的分片） */
-    INIT_LIST_HEAD(&frame->rtx);
 
     /* 重置字段 */
     atomic_store(&frame->refcount, 0);

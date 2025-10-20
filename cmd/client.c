@@ -23,6 +23,9 @@
 static volatile int g_running = 1;
 static volatile int g_connected = 0;
 
+/* 输出文件 */
+static FILE* g_output_file = NULL;
+
 /* 获取当前时间（毫秒） */
 static uint64_t get_time_ms(void) {
     struct timeval tv;
@@ -48,10 +51,15 @@ static int on_frame(
 
     vtx_log_info("Received frame: type=%d size=%zu", frame_type, frame_size);
 
-    /* 打印部分内容（假设是文本） */
-    if (frame_data && frame_size > 0) {
-        printf("  Content: %.*s\n", (int)(frame_size > 100 ? 100 : frame_size),
-               (char*)frame_data);
+    /* 将帧数据写入输出文件 */
+    if (g_output_file && frame_data && frame_size > 0) {
+        size_t written = fwrite(frame_data, 1, frame_size, g_output_file);
+        if (written != frame_size) {
+            vtx_log_error("Failed to write frame data: written=%zu, expected=%zu",
+                         written, frame_size);
+        } else {
+            vtx_log_debug("Written %zu bytes to output file", written);
+        }
     }
 
     return VTX_OK;
@@ -135,6 +143,14 @@ int main(int argc, char* argv[]) {
     vtx_log_info("VTX Client starting...");
     vtx_log_info("Connecting to %s:%u", server_addr, server_port);
 
+    /* 打开输出文件 */
+    g_output_file = fopen("data/output.mp4", "wb");
+    if (!g_output_file) {
+        vtx_log_error("Failed to open output file: data/output.mp4");
+        return EXIT_FAILURE;
+    }
+    vtx_log_info("Output file opened: data/output.mp4");
+
     /* 注册信号处理 */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -156,21 +172,42 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    /* 先创建poll线程，让协议栈运行起来 */
+    ret = pthread_create(&poll_tid, NULL, poll_thread, rx);
+    if (ret != 0) {
+        vtx_log_error("Failed to create poll thread: %d", ret);
+        vtx_rx_destroy(rx);
+        return EXIT_FAILURE;
+    }
+
+    vtx_log_info("Poll thread started");
+
+    /* 稍微等待让poll线程启动 */
+    usleep(100000);  /* 100ms */
+
+    vtx_log_info("Calling vtx_rx_connect()...");
+
     /* 连接到服务器 */
     ret = vtx_rx_connect(rx);
+
     if (ret != VTX_OK) {
         vtx_log_error("Failed to connect: %d", ret);
+        g_running = 0;
+        pthread_join(poll_tid, NULL);
         vtx_rx_destroy(rx);
         return EXIT_FAILURE;
     }
 
     /* 等待连接建立（最多等待5秒） */
+    vtx_log_info("Waiting for connection establishment...");
     for (int i = 0; i < 50 && !g_connected && g_running; i++) {
         usleep(100000);  /* 100ms */
     }
 
     if (!g_connected) {
         vtx_log_error("Connection timeout");
+        g_running = 0;
+        pthread_join(poll_tid, NULL);
         vtx_rx_close(rx);
         vtx_rx_destroy(rx);
         return EXIT_FAILURE;
@@ -186,35 +223,26 @@ int main(int argc, char* argv[]) {
         vtx_log_info("Requested media streaming from server");
     }
 
-    /* 创建poll线程 */
-    ret = pthread_create(&poll_tid, NULL, poll_thread, rx);
-    if (ret != 0) {
-        vtx_log_error("Failed to create poll thread: %d", ret);
-        vtx_rx_close(rx);
-        vtx_rx_destroy(rx);
-        return EXIT_FAILURE;
-    }
-
-    /* 主循环：定期发送心跳数据 */
-    int heartbeat_count = 0;
+    /* 主循环：定期发送测试数据 */
+    int data_count = 0;
     while (g_running && g_connected) {
         sleep(2);
 
-        /* 发送心跳数据 */
-        char heartbeat_data[128];
-        snprintf(heartbeat_data, sizeof(heartbeat_data),
-                 "Heartbeat from client #%d, timestamp=%llu",
-                 heartbeat_count++, (unsigned long long)get_time_ms());
+        /* 发送测试数据 */
+        char test_data[128];
+        snprintf(test_data, sizeof(test_data),
+                 "Test data from client #%d, timestamp=%llu",
+                 data_count++, (unsigned long long)get_time_ms());
 
-        ret = vtx_rx_send(rx, (uint8_t*)heartbeat_data, strlen(heartbeat_data));
+        ret = vtx_rx_send(rx, (uint8_t*)test_data, strlen(test_data));
         if (ret != VTX_OK) {
-            vtx_log_error("Failed to send heartbeat: %d", ret);
+            vtx_log_error("Failed to send data: %d", ret);
         } else {
-            vtx_log_debug("Sent heartbeat: %s", heartbeat_data);
+            vtx_log_info("Sent data: %s", test_data);
         }
 
         /* 每10次打印统计信息 */
-        if (heartbeat_count % 10 == 0) {
+        if (data_count % 10 == 0) {
             vtx_rx_stats_t stats;
             if (vtx_rx_get_stats(rx, &stats) == VTX_OK) {
                 vtx_log_info("Stats: frames=%llu packets=%llu bytes=%llu lost=%llu",
@@ -233,6 +261,12 @@ int main(int argc, char* argv[]) {
 
     vtx_rx_close(rx);
     vtx_rx_destroy(rx);
+
+    /* 关闭输出文件 */
+    if (g_output_file) {
+        fclose(g_output_file);
+        vtx_log_info("Output file closed");
+    }
 
     vtx_log_info("Client stopped");
 
