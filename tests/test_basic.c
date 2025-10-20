@@ -1,0 +1,248 @@
+/**
+ * @file test_basic.c
+ * @brief Basic VTX API Test
+ *
+ * 测试VTX基本功能：
+ * - 创建TX/RX
+ * - 连接
+ * - 发送/接收数据包
+ * - 统计信息
+ * - 清理资源
+ */
+
+#include "vtx.h"
+#include "vtx_log.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+
+static volatile int g_running = 1;
+static volatile int g_connected = 0;
+static volatile int g_received = 0;
+
+/* RX回调 */
+static int on_frame(
+    const uint8_t* frame_data,
+    size_t frame_size,
+    vtx_frame_type_t frame_type,
+    void* userdata)
+{
+    (void)userdata;
+    printf("RX: Received frame type=%d size=%zu\n", frame_type, frame_size);
+    g_received = 1;
+    return VTX_OK;
+}
+
+static int on_data(
+    vtx_data_type_t ctrl_type,
+    const uint8_t* data,
+    size_t size,
+    void* userdata)
+{
+    (void)userdata;
+    if (ctrl_type == VTX_DATA_USER && data && size > 0) {
+        printf("RX: Received DATA: %.*s\n", (int)size, (char*)data);
+        g_received = 1;
+    }
+    return VTX_OK;
+}
+
+static void on_connect(bool connected, void* userdata) {
+    (void)userdata;
+    g_connected = connected;
+    printf("RX: %s\n", connected ? "Connected" : "Disconnected");
+}
+
+/* RX线程 */
+static void* rx_thread(void* arg) {
+    vtx_rx_t* rx = (vtx_rx_t*)arg;
+
+    printf("RX thread started\n");
+
+    while (g_running) {
+        int ret = vtx_rx_poll(rx, 100);
+        if (ret < 0) {
+            fprintf(stderr, "vtx_rx_poll failed: %d\n", ret);
+            break;
+        }
+    }
+
+    printf("RX thread stopped\n");
+    return NULL;
+}
+
+/* TX线程 */
+static void* tx_thread(void* arg) {
+    vtx_tx_t* tx = (vtx_tx_t*)arg;
+
+    printf("TX thread started\n");
+
+    while (g_running) {
+        int ret = vtx_tx_poll(tx, 100);
+        if (ret < 0) {
+            fprintf(stderr, "vtx_tx_poll failed: %d\n", ret);
+            break;
+        }
+    }
+
+    printf("TX thread stopped\n");
+    return NULL;
+}
+
+/* Accept包装函数 */
+static void* accept_wrapper(void* arg) {
+    vtx_tx_t* tx = (vtx_tx_t*)arg;
+    vtx_tx_accept(tx, 5000);  /* 5秒超时 */
+    return NULL;
+}
+
+int main(void) {
+    int ret;
+    pthread_t rx_tid, tx_tid;
+
+    printf("=== VTX Basic Test ===\n");
+    printf("Version: %s\n", vtx_version());
+    printf("Build: %s\n", vtx_build_info());
+    printf("\n");
+
+    /* 创建TX */
+    vtx_tx_config_t tx_config = {
+        .bind_addr = "127.0.0.1",
+        .bind_port = 8888,
+        .mtu = VTX_DEFAULT_MTU,
+        .send_buf_size = VTX_DEFAULT_SEND_BUF,
+        .retrans_timeout_ms = VTX_DEFAULT_RETRANS_TIMEOUT_MS,
+        .max_retrans = VTX_DEFAULT_MAX_RETRANS,
+        .data_retrans_timeout_ms = VTX_DEFAULT_DATA_RETRANS_TIMEOUT_MS,
+        .data_max_retrans = VTX_DEFAULT_MAX_RETRANS,
+    };
+
+    vtx_tx_t* tx = vtx_tx_create(&tx_config, NULL, NULL, NULL);
+    if (!tx) {
+        fprintf(stderr, "Failed to create TX\n");
+        return EXIT_FAILURE;
+    }
+
+    /* 启动监听 */
+    ret = vtx_tx_listen(tx);
+    if (ret != VTX_OK) {
+        fprintf(stderr, "Failed to listen: %d\n", ret);
+        vtx_tx_destroy(tx);
+        return EXIT_FAILURE;
+    }
+
+    /* 创建RX */
+    vtx_rx_config_t rx_config = {
+        .server_addr = "127.0.0.1",
+        .server_port = 8888,
+        .mtu = VTX_DEFAULT_MTU,
+        .recv_buf_size = VTX_DEFAULT_RECV_BUF,
+        .frame_timeout_ms = VTX_DEFAULT_FRAME_TIMEOUT_MS,
+    };
+
+    vtx_rx_t* rx = vtx_rx_create(&rx_config, on_frame, on_data,
+                                  on_connect, NULL);
+    if (!rx) {
+        fprintf(stderr, "Failed to create RX\n");
+        vtx_tx_destroy(tx);
+        return EXIT_FAILURE;
+    }
+
+    /* 在后台线程中TX accept */
+    printf("Creating accept thread...\n");
+    pthread_t accept_tid;
+    ret = pthread_create(&accept_tid, NULL, accept_wrapper, tx);
+    if (ret != 0) {
+        fprintf(stderr, "Failed to create accept thread: %d\n", ret);
+        vtx_rx_destroy(rx);
+        vtx_tx_destroy(tx);
+        return EXIT_FAILURE;
+    }
+
+    printf("Accept thread created, waiting...\n");
+    /* 等待一下让accept线程开始 */
+    usleep(100000);
+
+    /* RX连接 */
+    printf("RX connecting...\n");
+    ret = vtx_rx_connect(rx);
+    if (ret != VTX_OK) {
+        fprintf(stderr, "Failed to connect: %d\n", ret);
+        pthread_join(accept_tid, NULL);
+        vtx_rx_destroy(rx);
+        vtx_tx_destroy(tx);
+        return EXIT_FAILURE;
+    }
+
+    /* 等待TX接受完成 */
+    pthread_join(accept_tid, NULL);
+
+    printf("Connection established!\n\n");
+
+    /* 创建线程 */
+    pthread_create(&rx_tid, NULL, rx_thread, rx);
+    pthread_create(&tx_tid, NULL, tx_thread, tx);
+
+    /* 测试发送数据 */
+    sleep(1);
+
+    printf("TX sending data...\n");
+    const char* test_data = "Hello from TX!";
+    ret = vtx_tx_send(tx, (const uint8_t*)test_data, strlen(test_data));
+    if (ret != VTX_OK) {
+        fprintf(stderr, "TX send failed: %d\n", ret);
+    }
+
+    sleep(1);
+
+    printf("RX sending data...\n");
+    const char* reply_data = "Hello from RX!";
+    ret = vtx_rx_send(rx, (const uint8_t*)reply_data, strlen(reply_data));
+    if (ret != VTX_OK) {
+        fprintf(stderr, "RX send failed: %d\n", ret);
+    }
+
+    /* 等待接收 */
+    for (int i = 0; i < 50 && g_received < 2; i++) {
+        usleep(100000);  /* 100ms */
+    }
+
+    /* 获取统计 */
+    printf("\n=== Statistics ===\n");
+
+    vtx_tx_stats_t tx_stats;
+    if (vtx_tx_get_stats(tx, &tx_stats) == VTX_OK) {
+        printf("TX: frames=%llu packets=%llu bytes=%llu\n",
+               (unsigned long long)tx_stats.total_frames,
+               (unsigned long long)tx_stats.total_packets,
+               (unsigned long long)tx_stats.total_bytes);
+    }
+
+    vtx_rx_stats_t rx_stats;
+    if (vtx_rx_get_stats(rx, &rx_stats) == VTX_OK) {
+        printf("RX: frames=%llu packets=%llu bytes=%llu lost=%llu\n",
+               (unsigned long long)rx_stats.total_frames,
+               (unsigned long long)rx_stats.total_packets,
+               (unsigned long long)rx_stats.total_bytes,
+               (unsigned long long)rx_stats.lost_packets);
+    }
+
+    /* 清理 */
+    printf("\n=== Cleanup ===\n");
+    g_running = 0;
+
+    pthread_join(rx_tid, NULL);
+    pthread_join(tx_tid, NULL);
+
+    vtx_rx_close(rx);
+    vtx_tx_close(tx);
+
+    vtx_rx_destroy(rx);
+    vtx_tx_destroy(tx);
+
+    printf("\nTest %s\n", g_received >= 2 ? "PASSED" : "FAILED");
+
+    return g_received >= 2 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
