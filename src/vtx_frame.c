@@ -28,6 +28,21 @@ struct vtx_frame_pool {
     size_t             total_frees;  /* 总释放次数 */
 };
 
+/**
+ * @brief 分片内存池完整定义
+ */
+struct vtx_frag_pool {
+    struct list_head   free_list;    /* 空闲frag链表 */
+    size_t             free_count;   /* 空闲frag数量 */
+    size_t             total_count;  /* 总frag数量 */
+    vtx_spinlock_t     lock;         /* 自旋锁 */
+
+    /* 统计信息 */
+    size_t             peak_count;   /* 峰值使用数量 */
+    size_t             total_allocs; /* 总分配次数 */
+    size_t             total_frees;  /* 总释放次数 */
+};
+
 /* ========== 辅助函数 ========== */
 
 /**
@@ -62,6 +77,7 @@ static vtx_frame_t* vtx_frame_alloc(size_t data_size) {
 
     /* 初始化frame */
     INIT_LIST_HEAD(&frame->list);
+    INIT_LIST_HEAD(&frame->rtx);
     atomic_init(&frame->refcount, 0);
     frame->state = VTX_FRAME_STATE_FREE;
     frame->data_capacity = data_size;
@@ -221,6 +237,132 @@ void vtx_frame_pool_release(vtx_frame_pool_t* pool, vtx_frame_t* frame) {
     /* 归还到空闲链表 */
     vtx_spinlock_lock(&pool->lock);
     list_add_tail(&frame->list, &pool->free_list);
+    pool->free_count++;
+    pool->total_frees++;
+    vtx_spinlock_unlock(&pool->lock);
+}
+
+/* ========== 分片池管理 ========== */
+
+vtx_frag_pool_t* vtx_frag_pool_create(size_t initial_size) {
+    vtx_frag_pool_t* pool = (vtx_frag_pool_t*)vtx_calloc(1, sizeof(vtx_frag_pool_t));
+    if (!pool) {
+        vtx_log_error("Failed to allocate frag pool");
+        return NULL;
+    }
+
+    /* 初始化链表和锁 */
+    INIT_LIST_HEAD(&pool->free_list);
+    vtx_spinlock_init(&pool->lock);
+
+    /* 预分配frag */
+    for (size_t i = 0; i < initial_size; i++) {
+        vtx_frag_t* frag = (vtx_frag_t*)vtx_calloc(1, sizeof(vtx_frag_t));
+        if (!frag) {
+            vtx_log_error("Failed to allocate frag");
+            vtx_frag_pool_destroy(pool);
+            return NULL;
+        }
+
+        INIT_LIST_HEAD(&frag->list);
+        list_add_tail(&frag->list, &pool->free_list);
+        pool->free_count++;
+        pool->total_count++;
+    }
+
+    vtx_log_info("Frag pool created: initial=%zu", initial_size);
+
+    return pool;
+}
+
+void vtx_frag_pool_destroy(vtx_frag_pool_t* pool) {
+    if (!pool) {
+        return;
+    }
+
+    /* 释放所有frag */
+    vtx_spinlock_lock(&pool->lock);
+    vtx_frag_t* frag;
+    vtx_frag_t* tmp;
+    size_t leaked = 0;
+
+    list_for_each_entry_safe(frag, tmp, &pool->free_list, list) {
+        list_del(&frag->list);
+        vtx_free(frag);
+    }
+
+    leaked = pool->total_count - pool->free_count;
+    if (leaked > 0) {
+        vtx_log_warn("Frag pool destroyed: leaked=%zu", leaked);
+    }
+
+    vtx_spinlock_unlock(&pool->lock);
+
+    vtx_spinlock_destroy(&pool->lock);
+
+    vtx_log_info("Frag pool destroyed: total=%zu, leaked=%zu",
+                pool->total_count, leaked);
+
+    vtx_free(pool);
+}
+
+vtx_frag_t* vtx_frag_pool_acquire(vtx_frag_pool_t* pool) {
+    if (!pool) {
+        return NULL;
+    }
+
+    vtx_spinlock_lock(&pool->lock);
+
+    vtx_frag_t* frag = NULL;
+
+    if (!list_empty(&pool->free_list)) {
+        /* 从空闲链表获取 */
+        frag = list_first_entry(&pool->free_list, vtx_frag_t, list);
+        list_del(&frag->list);
+        pool->free_count--;
+    } else {
+        /* 池为空，动态分配 */
+        vtx_spinlock_unlock(&pool->lock);
+
+        frag = (vtx_frag_t*)vtx_calloc(1, sizeof(vtx_frag_t));
+        if (!frag) {
+            vtx_log_error("Failed to allocate frag");
+            return NULL;
+        }
+
+        INIT_LIST_HEAD(&frag->list);
+
+        vtx_spinlock_lock(&pool->lock);
+        pool->total_count++;
+    }
+
+    pool->total_allocs++;
+    size_t used = pool->total_count - pool->free_count;
+    if (used > pool->peak_count) {
+        pool->peak_count = used;
+    }
+
+    vtx_spinlock_unlock(&pool->lock);
+
+    /* 初始化frag */
+    memset(frag, 0, sizeof(vtx_frag_t));
+    INIT_LIST_HEAD(&frag->list);
+
+    return frag;
+}
+
+void vtx_frag_pool_release(vtx_frag_pool_t* pool, vtx_frag_t* frag) {
+    if (!pool || !frag) {
+        return;
+    }
+
+    /* 重置frag */
+    memset(frag, 0, sizeof(vtx_frag_t));
+    INIT_LIST_HEAD(&frag->list);
+
+    /* 归还到空闲链表 */
+    vtx_spinlock_lock(&pool->lock);
+    list_add_tail(&frag->list, &pool->free_list);
     pool->free_count++;
     pool->total_frees++;
     vtx_spinlock_unlock(&pool->lock);
@@ -455,6 +597,9 @@ void vtx_frame_reset(vtx_frame_t* frame) {
         vtx_free(frame->bitmap);
         frame->bitmap = NULL;
     }
+
+    /* 重置rtx队列（注意：调用者应在此之前清理rtx中的分片） */
+    INIT_LIST_HEAD(&frame->rtx);
 
     /* 重置字段 */
     atomic_store(&frame->refcount, 0);

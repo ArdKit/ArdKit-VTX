@@ -48,6 +48,25 @@ typedef enum {
     VTX_FRAME_STATE_SENDING,    /* 正在发送/等待确认 */
 } vtx_frame_state_t;
 
+/* ========== 分片结构 ========== */
+
+/**
+ * @brief 分片信息（用于重传管理）
+ *
+ * 设计说明：
+ * - 每个分片对应一个网络包
+ * - 用于跟踪分片的发送/接收状态
+ * - 支持细粒度的重传控制
+ */
+typedef struct vtx_frag {
+    struct list_head list;           /* 链表节点（用于重传队列） */
+    uint16_t         frag_index;     /* 分片索引 */
+    bool             received;       /* 是否已接收（RX端使用） */
+    uint8_t          retrans_count;  /* 重传次数 */
+    uint64_t         send_time_ms;   /* 发送时间（用于重传超时） */
+    uint32_t         seq_num;        /* 该分片的序列号 */
+} vtx_frag_t;
+
 /* ========== 帧结构（统一frame和pkg） ========== */
 
 /**
@@ -80,6 +99,9 @@ typedef struct vtx_frame {
     uint64_t         last_recv_ms;   /* 最后接收时间 */
     uint64_t         send_time_ms;   /* 发送时间（用于重传超时） */
     uint8_t          retrans_count;  /* 重传次数 */
+
+    /* 重传队列（细粒度分片管理） */
+    struct list_head rtx;            /* 重传队列（vtx_frag_t链表） */
 
     /* 帧数据（动态分配） */
     uint8_t*         data;           /* 帧数据缓冲区指针 */
@@ -147,6 +169,65 @@ vtx_frame_t* vtx_frame_pool_acquire(vtx_frame_pool_t* pool);
  * - 不应直接调用此函数，应使用vtx_frame_release
  */
 void vtx_frame_pool_release(vtx_frame_pool_t* pool, vtx_frame_t* frame);
+
+/* ========== 分片池（frag池） ========== */
+
+/**
+ * @brief 分片内存池（不透明类型）
+ *
+ * 注意：
+ * - 使用自旋锁保护空闲链表
+ * - 支持动态扩展（按需分配新frag）
+ * - 完整定义在vtx_frame.c中
+ */
+typedef struct vtx_frag_pool vtx_frag_pool_t;
+
+/**
+ * @brief 创建分片内存池
+ *
+ * @param initial_size 初始frag数量
+ * @return vtx_frag_pool_t* 成功返回内存池对象，失败返回NULL
+ *
+ * 注意：
+ * - 预分配initial_size个frag
+ * - 内存池可按需动态扩展
+ */
+vtx_frag_pool_t* vtx_frag_pool_create(size_t initial_size);
+
+/**
+ * @brief 销毁分片内存池
+ *
+ * @param pool 内存池对象
+ *
+ * 注意：
+ * - 释放所有frag（包括正在使用的）
+ * - 如果有frag仍被使用，会打印警告（DEBUG模式）
+ */
+void vtx_frag_pool_destroy(vtx_frag_pool_t* pool);
+
+/**
+ * @brief 从池中获取frag
+ *
+ * @param pool 内存池对象
+ * @return vtx_frag_t* 成功返回frag，失败返回NULL
+ *
+ * 注意：
+ * - 如果池为空，自动分配新frag
+ * - 返回的frag已初始化为0
+ * - 使用完毕后需调用vtx_frag_pool_release释放
+ */
+vtx_frag_t* vtx_frag_pool_acquire(vtx_frag_pool_t* pool);
+
+/**
+ * @brief 归还frag到池中
+ *
+ * @param pool 内存池对象
+ * @param frag frag对象
+ *
+ * 注意：
+ * - frag会被重置后归还到池中
+ */
+void vtx_frag_pool_release(vtx_frag_pool_t* pool, vtx_frag_t* frag);
 
 /* ========== frame引用计数 ========== */
 
