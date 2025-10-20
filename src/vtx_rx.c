@@ -40,6 +40,9 @@ struct vtx_rx {
     socklen_t              server_addr_len;  /* 地址长度 */
     bool                   connected;        /* 连接状态 */
 
+    /* 心跳管理 */
+    uint64_t               last_heartbeat_send_ms;  /* 最后发送心跳时间 */
+
     /* 配置 */
     vtx_rx_config_t        config;           /* 配置副本 */
 
@@ -428,14 +431,49 @@ static int vtx_recv_packet(vtx_rx_t* rx) {
         break;
     }
 
-    case VTX_DATA_DISCONNECT:
+    case VTX_DATA_CONNECTED: {
+        /* 收到CONNECTED帧，发送ACK完成3次握手 */
+        vtx_log_info("Received CONNECTED from server");
+
+        /* 发送ACK */
+        vtx_packet_header_t ack_header = {0};
+        ack_header.seq_num = atomic_fetch_add(&rx->seq_num, 1);
+        ack_header.frame_id = 0;
+        ack_header.frame_type = VTX_DATA_ACK;
+        vtx_send_packet(rx, &ack_header, NULL, 0);
+
+        /* 设置连接状态 */
+        rx->connected = true;
+        rx->last_heartbeat_send_ms = vtx_get_time_ms();
+
+        /* 调用连接回调 */
+        if (rx->connect_fn) {
+            rx->connect_fn(true, rx->userdata);
+        }
+        break;
+    }
+
+    case VTX_DATA_DISCONNECT: {
+        /* 断开连接请求：发送ACK并断开 */
+        vtx_log_info("Disconnect request from server");
+
+        /* 发送ACK */
+        vtx_packet_header_t ack_header = {0};
+        ack_header.seq_num = atomic_fetch_add(&rx->seq_num, 1);
+        ack_header.frame_id = 0;
+        ack_header.frame_type = VTX_DATA_ACK;
+        vtx_send_packet(rx, &ack_header, NULL, 0);
+
         /* 断开连接 */
         rx->connected = false;
+        rx->last_heartbeat_send_ms = 0;
+
+        /* 调用连接回调 */
         if (rx->connect_fn) {
             rx->connect_fn(false, rx->userdata);
         }
-        vtx_log_info("Server disconnected");
         break;
+    }
 
     case VTX_DATA_USER:
         /* 数据包 */
@@ -482,6 +520,9 @@ vtx_rx_t* vtx_rx_create(
     }
     if (rx->config.frame_timeout_ms == 0) {
         rx->config.frame_timeout_ms = VTX_DEFAULT_FRAME_TIMEOUT_MS;
+    }
+    if (rx->config.heartbeat_interval_ms == 0) {
+        rx->config.heartbeat_interval_ms = VTX_DEFAULT_HEARTBEAT_INTERVAL_MS;
     }
 
     /* 创建socket */
@@ -629,6 +670,30 @@ int vtx_rx_poll(vtx_rx_t* rx, uint32_t timeout_ms) {
                 vtx_log_debug("Cleaned %zu timeout frames", cleaned);
             }
         }
+
+        /* 发送心跳（连接建立后） */
+        if (rx->connected && rx->last_heartbeat_send_ms > 0) {
+            uint64_t now_ms = vtx_get_time_ms();
+            uint64_t elapsed = now_ms - rx->last_heartbeat_send_ms;
+
+            if (elapsed >= rx->config.heartbeat_interval_ms) {
+                /* 发送心跳 */
+                vtx_packet_header_t hb_header = {0};
+                hb_header.seq_num = atomic_fetch_add(&rx->seq_num, 1);
+                hb_header.frame_id = 0;
+                hb_header.frame_type = VTX_DATA_HEARTBEAT;
+                vtx_send_packet(rx, &hb_header, NULL, 0);
+
+                rx->last_heartbeat_send_ms = now_ms;
+                vtx_log_debug("Heartbeat sent");
+            }
+        }
+
+        /* 检查连接状态 */
+        if (!rx->running) {
+            return VTX_ERR_DISCONNECTED;
+        }
+
         return 0;
     }
 

@@ -40,6 +40,14 @@ struct vtx_tx {
     socklen_t              client_addr_len;  /* 地址长度 */
     bool                   connected;        /* 连接状态 */
 
+    /* 连接管理 */
+    uint8_t                connect_retrans_count;  /* CONNECTED重传次数 */
+    uint64_t               connect_send_time_ms;   /* CONNECTED发送时间 */
+
+    /* 心跳管理 */
+    uint64_t               last_heartbeat_ms;      /* 最后收到心跳时间 */
+    uint8_t                heartbeat_miss_count;   /* 连续丢失心跳次数 */
+
     /* 配置 */
     vtx_tx_config_t        config;           /* 配置副本 */
 
@@ -367,6 +375,52 @@ static void vtx_process_retrans_queue(vtx_tx_t* tx) {
         }
     }
     vtx_spinlock_unlock(&tx->iframe_lock);
+
+    /* 处理CONNECTED帧重传（3次握手第二步） */
+    if (!tx->connected && tx->connect_send_time_ms > 0) {
+        uint64_t elapsed = now_ms - tx->connect_send_time_ms;
+
+        /* 检查重传次数是否超限 */
+        if (tx->connect_retrans_count >= tx->config.connect_max_retrans) {
+            vtx_log_warn("CONNECTED handshake failed: max retrans exceeded");
+            tx->connect_send_time_ms = 0;
+            tx->connect_retrans_count = 0;
+            /* 回退到空闲状态 */
+            return;
+        }
+
+        /* 检查是否需要重传CONNECTED */
+        if (elapsed >= tx->config.connect_timeout_ms) {
+            tx->connect_retrans_count++;
+            tx->connect_send_time_ms = now_ms;
+
+            vtx_log_debug("Retransmitting CONNECTED: retrans=%u",
+                        tx->connect_retrans_count);
+
+            /* 重新发送CONNECTED */
+            vtx_packet_header_t conn_header = {0};
+            conn_header.seq_num = atomic_fetch_add(&tx->seq_num, 1);
+            conn_header.frame_id = 0;
+            conn_header.frame_type = VTX_DATA_CONNECTED;
+            conn_header.flags = VTX_FLAG_RETRANS;
+            vtx_send_packet(tx, &conn_header, NULL, 0);
+        }
+    }
+
+    /* 检测心跳超时（连接建立后） */
+    if (tx->connected && tx->last_heartbeat_ms > 0) {
+        uint64_t elapsed = now_ms - tx->last_heartbeat_ms;
+        uint64_t timeout = tx->config.heartbeat_interval_ms * tx->config.heartbeat_max_miss;
+
+        if (elapsed >= timeout) {
+            vtx_log_warn("Heartbeat timeout: %u missed heartbeats, disconnecting",
+                       tx->config.heartbeat_max_miss);
+            tx->connected = false;
+            tx->connect_retrans_count = 0;
+            tx->heartbeat_miss_count = 0;
+            tx->last_heartbeat_ms = 0;
+        }
+    }
 }
 
 /**
@@ -409,9 +463,19 @@ static int vtx_recv(vtx_tx_t* tx) {
     /* 使用状态机处理数据帧 */
     switch (header.frame_type) {
     case VTX_DATA_ACK: {
-        /* ACK包，可能是数据帧ACK或媒体帧分片ACK */
+        /* ACK包，可能是数据帧ACK、CONNECTED ACK或媒体帧分片ACK */
 
-        /* 先检查是否是数据帧ACK */
+        /* 检查是否是CONNECTED的ACK（frame_id==0表示连接ACK） */
+        if (header.frame_id == 0 && !tx->connected) {
+            tx->connected = true;
+            tx->connect_retrans_count = 0;
+            tx->last_heartbeat_ms = vtx_get_time_ms();
+            tx->heartbeat_miss_count = 0;
+            vtx_log_info("Connection established with client");
+            break;
+        }
+
+        /* 检查是否是数据帧ACK */
         vtx_frame_t* data_frame = vtx_frame_queue_find(tx->data_queue,
                                                         header.frame_id);
         if (data_frame) {
@@ -437,19 +501,60 @@ static int vtx_recv(vtx_tx_t* tx) {
         break;
     }
 
-    case VTX_DATA_CONNECT:
-        /* 连接请求 */
-        tx->connected = true;
-        vtx_log_info("Client connected from %s:%d",
+    case VTX_DATA_CONNECT: {
+        /* 连接请求：保存客户端地址，发送CONNECTED帧 */
+        vtx_log_info("Connection request from %s:%d",
                     inet_ntoa(from_addr.sin_addr),
                     ntohs(from_addr.sin_port));
-        break;
 
-    case VTX_DATA_DISCONNECT:
+        /* 保存客户端地址 */
+        tx->client_addr = from_addr;
+        tx->client_addr_len = from_len;
+
+        /* 发送CONNECTED响应 */
+        vtx_packet_header_t conn_header = {0};
+        conn_header.seq_num = atomic_fetch_add(&tx->seq_num, 1);
+        conn_header.frame_id = 0;  /* 连接帧使用frame_id=0 */
+        conn_header.frame_type = VTX_DATA_CONNECTED;
+        vtx_send_packet(tx, &conn_header, NULL, 0);
+
+        /* 设置重传状态 */
+        tx->connect_send_time_ms = vtx_get_time_ms();
+        tx->connect_retrans_count = 0;
+        break;
+    }
+
+    case VTX_DATA_DISCONNECT: {
+        /* 断开连接请求：发送ACK并断开 */
+        vtx_log_info("Disconnect request from client");
+
+        /* 发送ACK */
+        vtx_packet_header_t ack_header = {0};
+        ack_header.seq_num = atomic_fetch_add(&tx->seq_num, 1);
+        ack_header.frame_id = 0;
+        ack_header.frame_type = VTX_DATA_ACK;
+        vtx_send_packet(tx, &ack_header, NULL, 0);
+
         /* 断开连接 */
         tx->connected = false;
-        vtx_log_info("Client disconnected");
+        tx->connect_retrans_count = 0;
+        tx->heartbeat_miss_count = 0;
         break;
+    }
+
+    case VTX_DATA_HEARTBEAT: {
+        /* 心跳包：发送ACK并更新时间戳 */
+        vtx_packet_header_t ack_header = {0};
+        ack_header.seq_num = atomic_fetch_add(&tx->seq_num, 1);
+        ack_header.frame_id = 0;
+        ack_header.frame_type = VTX_DATA_ACK;
+        vtx_send_packet(tx, &ack_header, NULL, 0);
+
+        /* 更新心跳时间 */
+        tx->last_heartbeat_ms = vtx_get_time_ms();
+        tx->heartbeat_miss_count = 0;
+        break;
+    }
 
     case VTX_DATA_START:
         /* 开始媒体传输 */
@@ -531,6 +636,18 @@ vtx_tx_t* vtx_tx_create(
     }
     if (tx->config.data_max_retrans == 0) {
         tx->config.data_max_retrans = VTX_DEFAULT_MAX_RETRANS;
+    }
+    if (tx->config.connect_timeout_ms == 0) {
+        tx->config.connect_timeout_ms = VTX_DEFAULT_CONNECT_TIMEOUT_MS;
+    }
+    if (tx->config.connect_max_retrans == 0) {
+        tx->config.connect_max_retrans = VTX_DEFAULT_CONNECT_MAX_RETRANS;
+    }
+    if (tx->config.heartbeat_interval_ms == 0) {
+        tx->config.heartbeat_interval_ms = VTX_DEFAULT_HEARTBEAT_INTERVAL_MS;
+    }
+    if (tx->config.heartbeat_max_miss == 0) {
+        tx->config.heartbeat_max_miss = VTX_DEFAULT_HEARTBEAT_MAX_MISS;
     }
 
     /* 创建socket */
@@ -705,6 +822,12 @@ int vtx_tx_poll(vtx_tx_t* tx, uint32_t timeout_ms) {
     if (ret == 0) {
         /* 超时：处理重传队列 */
         vtx_process_retrans_queue(tx);
+
+        /* 检查连接状态（心跳超时可能导致断连） */
+        if (!tx->running) {
+            return VTX_ERR_DISCONNECTED;
+        }
+
         return 0;
     }
 
