@@ -534,6 +534,66 @@ int vtx_tx_poll(vtx_tx_t* tx, uint32_t timeout_ms) {
     }
 
     if (ret == 0) {
+        /* 超时：处理重传队列 */
+        uint64_t now_ms = vtx_get_time_ms();
+        vtx_frame_t* frame;
+        vtx_frame_t* tmp;
+
+        vtx_spinlock_lock(&tx->data_queue->lock);
+
+        list_for_each_entry_safe(frame, tmp, &tx->data_queue->frames, list) {
+            /* 检查重传次数是否超限 */
+            if (frame->retrans_count >= tx->config.data_max_retrans) {
+                vtx_log_warn("Frame dropped: id=%u, retrans=%u",
+                           frame->frame_id, frame->retrans_count);
+
+                /* 从队列移除并释放 */
+                list_del(&frame->list);
+                tx->data_queue->count--;
+                vtx_spinlock_unlock(&tx->data_queue->lock);
+
+                vtx_frame_release(tx->data_pool, frame);
+
+                vtx_spinlock_lock(&tx->data_queue->lock);
+                continue;
+            }
+
+            /* 检查是否需要重传 */
+            uint64_t elapsed = now_ms - frame->send_time_ms;
+            if (elapsed >= tx->config.data_retrans_timeout_ms) {
+                /* 需要重传 */
+                frame->retrans_count++;
+                frame->send_time_ms = now_ms;
+
+                vtx_log_debug("Retransmitting frame: id=%u, retrans=%u, elapsed=%llu ms",
+                            frame->frame_id, frame->retrans_count,
+                            (unsigned long long)elapsed);
+
+                /* 重新发送数据包 */
+                vtx_packet_header_t header = {0};
+                header.seq_num = atomic_fetch_add(&tx->seq_num, 1);
+                header.frame_id = frame->frame_id;
+                header.frame_type = VTX_DATA_USER;
+                header.frag_index = 0;
+                header.total_frags = 1;
+                header.payload_size = frame->data_size;
+                header.flags = VTX_FLAG_RETRANS;
+
+                vtx_spinlock_unlock(&tx->data_queue->lock);
+
+                vtx_send_packet(tx, &header, frame->data, frame->data_size);
+
+                /* 更新统计 */
+                vtx_spinlock_lock(&tx->stats_lock);
+                tx->stats.retrans_packets++;
+                vtx_spinlock_unlock(&tx->stats_lock);
+
+                vtx_spinlock_lock(&tx->data_queue->lock);
+            }
+        }
+
+        vtx_spinlock_unlock(&tx->data_queue->lock);
+
         return 0;  /* 超时 */
     }
 
