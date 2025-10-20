@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #ifdef __APPLE__
 #include <libkern/OSByteOrder.h>
@@ -54,10 +55,10 @@ struct vtx_rx {
     vtx_frame_t*           last_iframe;      /* 最后一个I帧 */
     vtx_spinlock_t         iframe_lock;      /* I帧锁 */
 
-    /* 序列号 */
-    uint32_t               seq_num;          /* 全局序列号 */
-    uint16_t               frame_id;         /* 帧ID */
-    uint32_t               last_recv_seq;    /* 最后接收的序列号 */
+    /* 序列号（原子操作） */
+    atomic_uint_fast32_t   seq_num;          /* 全局序列号 */
+    atomic_uint_fast16_t   frame_id;         /* 帧ID */
+    atomic_uint_fast32_t   last_recv_seq;    /* 最后接收的序列号 */
 
     /* 统计 */
     vtx_rx_stats_t         stats;            /* 统计信息 */
@@ -174,7 +175,7 @@ static int vtx_send_packet(
  */
 static int vtx_send_ack(vtx_rx_t* rx, uint16_t frame_id) {
     vtx_packet_header_t header = {0};
-    header.seq_num = rx->seq_num++;
+    header.seq_num = atomic_fetch_add(&rx->seq_num, 1);
     header.frame_id = frame_id;
     header.frame_type = VTX_DATA_ACK;
     return vtx_send_packet(rx, &header, NULL, 0);
@@ -284,6 +285,65 @@ static int vtx_handle_fragment(
 }
 
 /**
+ * @brief 处理重传队列（超时重传和清理）
+ */
+static void vtx_process_retrans_queue(vtx_rx_t* rx) {
+    uint64_t now_ms = vtx_get_time_ms();
+    vtx_frame_t* frame;
+    vtx_frame_t* tmp;
+
+    vtx_spinlock_lock(&rx->data_queue->lock);
+
+    list_for_each_entry_safe(frame, tmp, &rx->data_queue->frames, list) {
+        /* 检查重传次数是否超限 */
+        if (frame->retrans_count >= 3) {
+            vtx_log_warn("Frame dropped: id=%u, retrans=%u",
+                       frame->frame_id, frame->retrans_count);
+
+            /* 从队列移除并释放 */
+            list_del(&frame->list);
+            rx->data_queue->count--;
+            vtx_spinlock_unlock(&rx->data_queue->lock);
+
+            vtx_frame_release(rx->data_pool, frame);
+
+            vtx_spinlock_lock(&rx->data_queue->lock);
+            continue;
+        }
+
+        /* 检查是否需要重传 */
+        uint64_t elapsed = now_ms - frame->send_time_ms;
+        if (elapsed >= 100) {  /* 100ms 超时 */
+            /* 需要重传 */
+            frame->retrans_count++;
+            frame->send_time_ms = now_ms;
+
+            vtx_log_debug("Retransmitting frame: id=%u, retrans=%u, elapsed=%llu ms",
+                        frame->frame_id, frame->retrans_count,
+                        (unsigned long long)elapsed);
+
+            /* 重新发送数据包 */
+            vtx_packet_header_t header = {0};
+            header.seq_num = atomic_fetch_add(&rx->seq_num, 1);
+            header.frame_id = frame->frame_id;
+            header.frame_type = VTX_DATA_USER;
+            header.frag_index = 0;
+            header.total_frags = 1;
+            header.payload_size = frame->data_size;
+            header.flags = VTX_FLAG_RETRANS;
+
+            vtx_spinlock_unlock(&rx->data_queue->lock);
+
+            vtx_send_packet(rx, &header, frame->data, frame->data_size);
+
+            vtx_spinlock_lock(&rx->data_queue->lock);
+        }
+    }
+
+    vtx_spinlock_unlock(&rx->data_queue->lock);
+}
+
+/**
  * @brief 接收并处理数据包
  */
 static int vtx_recv_packet(vtx_rx_t* rx) {
@@ -327,23 +387,26 @@ static int vtx_recv_packet(vtx_rx_t* rx) {
     }
 
     /* 检测丢包 */
-    if (rx->last_recv_seq > 0 && header.seq_num > rx->last_recv_seq + 1) {
-        uint32_t lost = header.seq_num - rx->last_recv_seq - 1;
+    uint32_t last_seq = atomic_load(&rx->last_recv_seq);
+    if (last_seq > 0 && header.seq_num > last_seq + 1) {
+        uint32_t lost = header.seq_num - last_seq - 1;
         vtx_spinlock_lock(&rx->stats_lock);
         rx->stats.lost_packets += lost;
         vtx_spinlock_unlock(&rx->stats_lock);
     }
-    rx->last_recv_seq = header.seq_num;
+    atomic_store(&rx->last_recv_seq, header.seq_num);
 
     /* 发送ACK（对任意包都ACK） */
     vtx_send_ack(rx, header.frame_id);
 
-    /* 处理不同类型的包 */
+    /* 使用状态机处理不同类型的包 */
     if (header.frame_type >= VTX_FRAME_I && header.frame_type <= VTX_FRAME_A) {
         /* 媒体帧分片 */
-        return vtx_handle_fragment(rx, &header,
-                                   buf + VTX_PACKET_HEADER_SIZE);
-    } else if (header.frame_type == VTX_DATA_ACK) {
+        return vtx_handle_fragment(rx, &header, buf + VTX_PACKET_HEADER_SIZE);
+    }
+
+    switch (header.frame_type) {
+    case VTX_DATA_ACK: {
         /* ACK包，从data_queue中移除对应的frame */
         vtx_frame_t* frame = vtx_frame_queue_find(rx->data_queue,
                                                    header.frame_id);
@@ -351,14 +414,19 @@ static int vtx_recv_packet(vtx_rx_t* rx) {
             vtx_frame_queue_remove(rx->data_queue, frame);
             vtx_frame_release(rx->data_pool, frame);
         }
-    } else if (header.frame_type == VTX_DATA_DISCONNECT) {
+        break;
+    }
+
+    case VTX_DATA_DISCONNECT:
         /* 断开连接 */
         rx->connected = false;
         if (rx->connect_fn) {
             rx->connect_fn(false, rx->userdata);
         }
         vtx_log_info("Server disconnected");
-    } else if (header.frame_type == VTX_DATA_USER) {
+        break;
+
+    case VTX_DATA_USER:
         /* 数据包 */
         if (rx->data_fn) {
             rx->data_fn(VTX_DATA_USER,
@@ -366,6 +434,11 @@ static int vtx_recv_packet(vtx_rx_t* rx) {
                        n - VTX_PACKET_HEADER_SIZE,
                        rx->userdata);
         }
+        break;
+
+    default:
+        vtx_log_warn("Unknown frame type: %u", header.frame_type);
+        break;
     }
 
     return 1;  /* 处理了一个包 */
@@ -473,7 +546,7 @@ int vtx_rx_connect(vtx_rx_t* rx) {
 
     /* 发送连接请求 */
     vtx_packet_header_t header = {0};
-    header.seq_num = rx->seq_num++;
+    header.seq_num = atomic_fetch_add(&rx->seq_num, 1);
     header.frame_type = VTX_DATA_CONNECT;
 
     int ret = vtx_send_packet(rx, &header, NULL, 0);
@@ -530,7 +603,9 @@ int vtx_rx_poll(vtx_rx_t* rx, uint32_t timeout_ms) {
     }
 
     if (ret == 0) {
-        /* 超时，清理超时帧 */
+        /* 超时：处理重传队列和清理超时帧 */
+        vtx_process_retrans_queue(rx);
+
         if (rx->recv_queue) {
             size_t cleaned = vtx_frame_queue_cleanup_timeout(
                 rx->recv_queue, vtx_get_time_ms());
@@ -567,7 +642,7 @@ int vtx_rx_send(vtx_rx_t* rx, const uint8_t* data, size_t size) {
         return VTX_ERR_NO_MEMORY;
     }
 
-    frame->frame_id = rx->frame_id++;
+    frame->frame_id = atomic_fetch_add(&rx->frame_id, 1);
     frame->frame_type = (vtx_frame_type_t)VTX_DATA_USER;
     frame->data_size = size;
     memcpy(frame->data, data, size);
@@ -575,7 +650,7 @@ int vtx_rx_send(vtx_rx_t* rx, const uint8_t* data, size_t size) {
 
     /* 发送 */
     vtx_packet_header_t header = {0};
-    header.seq_num = rx->seq_num++;
+    header.seq_num = atomic_fetch_add(&rx->seq_num, 1);
     header.frame_id = frame->frame_id;
     header.frame_type = VTX_DATA_USER;
     header.frag_index = 0;
@@ -606,7 +681,7 @@ int vtx_rx_start(vtx_rx_t* rx) {
 
     /* 发送START控制帧 */
     vtx_packet_header_t header = {0};
-    header.seq_num = rx->seq_num++;
+    header.seq_num = atomic_fetch_add(&rx->seq_num, 1);
     header.frame_type = VTX_DATA_START;
 
     int ret = vtx_send_packet(rx, &header, NULL, 0);
@@ -630,7 +705,7 @@ int vtx_rx_stop(vtx_rx_t* rx) {
 
     /* 发送STOP控制帧 */
     vtx_packet_header_t header = {0};
-    header.seq_num = rx->seq_num++;
+    header.seq_num = atomic_fetch_add(&rx->seq_num, 1);
     header.frame_type = VTX_DATA_STOP;
 
     int ret = vtx_send_packet(rx, &header, NULL, 0);
@@ -651,7 +726,7 @@ int vtx_rx_close(vtx_rx_t* rx) {
     if (rx->connected) {
         /* 发送断开连接 */
         vtx_packet_header_t header = {0};
-        header.seq_num = rx->seq_num++;
+        header.seq_num = atomic_fetch_add(&rx->seq_num, 1);
         header.frame_type = VTX_DATA_DISCONNECT;
         vtx_send_packet(rx, &header, NULL, 0);
 
