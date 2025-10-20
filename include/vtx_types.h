@@ -34,12 +34,13 @@ typedef enum {
  */
 typedef enum {
     VTX_DATA_CONNECT    = 0x10,  /* 连接请求 */
-    VTX_DATA_DISCONNECT = 0x11,  /* 断开连接 */
-    VTX_DATA_ACK        = 0x12,  /* 确认应答 */
-    VTX_DATA_HEARTBEAT  = 0x13,  /* 心跳包 */
-    VTX_DATA_USER       = 0x14,  /* 用户数据（可靠传输） */
-    VTX_DATA_START      = 0x15,  /* 开始媒体传输 */
-    VTX_DATA_STOP       = 0x16,  /* 停止媒体传输 */
+    VTX_DATA_CONNECTED  = 0x11,  /* 连接确认（TX响应） */
+    VTX_DATA_DISCONNECT = 0x12,  /* 断开连接 */
+    VTX_DATA_ACK        = 0x13,  /* 确认应答 */
+    VTX_DATA_HEARTBEAT  = 0x14,  /* 心跳包 */
+    VTX_DATA_USER       = 0x15,  /* 用户数据（可靠传输） */
+    VTX_DATA_START      = 0x16,  /* 开始媒体传输 */
+    VTX_DATA_STOP       = 0x17,  /* 停止媒体传输 */
 } vtx_data_type_t;
 
 /**
@@ -95,6 +96,10 @@ typedef struct {
     uint8_t     max_retrans;  /* I帧分片最大重传次数（默认3次） */
     uint32_t    data_retrans_timeout_ms; /* DATA包重传超时（默认30ms） */
     uint8_t     data_max_retrans; /* DATA包最大重传次数（默认3次） */
+    uint32_t    connect_timeout_ms; /* CONNECTED帧重传超时（默认100ms） */
+    uint8_t     connect_max_retrans; /* CONNECTED帧最大重传次数（默认3次） */
+    uint32_t    heartbeat_interval_ms; /* 心跳间隔（默认60000ms=1分钟） */
+    uint8_t     heartbeat_max_miss; /* 最大丢失心跳次数（默认3次） */
 #ifdef VTX_DEBUG
     float       drop_rate;    /* 丢包模拟率（0.0-1.0） */
 #endif
@@ -109,6 +114,7 @@ typedef struct {
     uint16_t    mtu;          /* MTU大小，默认1400字节 */
     uint32_t    recv_buf_size; /* 接收缓冲区大小 */
     uint32_t    frame_timeout_ms; /* 帧接收超时（默认100ms） */
+    uint32_t    heartbeat_interval_ms; /* 心跳发送间隔（默认60000ms=1分钟） */
 } vtx_rx_config_t;
 
 /* ========== 统计结构 ========== */
@@ -213,6 +219,10 @@ typedef void (*vtx_on_media_fn)(
 #define VTX_DEFAULT_MAX_RETRANS   3
 #define VTX_DEFAULT_DATA_RETRANS_TIMEOUT_MS 30
 #define VTX_DEFAULT_FRAME_TIMEOUT_MS 100
+#define VTX_DEFAULT_CONNECT_TIMEOUT_MS 100
+#define VTX_DEFAULT_CONNECT_MAX_RETRANS 3
+#define VTX_DEFAULT_HEARTBEAT_INTERVAL_MS (60 * 1000)  /* 1分钟 */
+#define VTX_DEFAULT_HEARTBEAT_MAX_MISS 3
 
 #ifdef __cplusplus
 }

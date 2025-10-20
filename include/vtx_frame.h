@@ -91,9 +91,6 @@ typedef struct vtx_frame {
     size_t           data_size;      /* 实际数据大小 */
     size_t           data_capacity;  /* 数据缓冲区容量 */
 
-    /* 分片跟踪 */
-    uint8_t*         bitmap;         /* 分片接收位图（动态分配） */
-
     /* 时间戳 */
     uint64_t         first_recv_ms;  /* 首次接收时间 */
     uint64_t         last_recv_ms;   /* 最后接收时间 */
