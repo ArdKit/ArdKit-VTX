@@ -745,6 +745,19 @@ int vtx_tx_send_media(vtx_tx_t* tx, vtx_frame_t* frame) {
             vtx_frame_release(tx->media_pool, frame);
             return ret;
         }
+
+        /* 对于I帧，添加分片到重传队列 */
+        if (frame->frame_type == VTX_FRAME_I) {
+            vtx_frag_t* frag = vtx_frag_pool_acquire(tx->frag_pool);
+            if (frag) {
+                frag->frag_index = i;
+                frag->seq_num = header.seq_num;
+                frag->retrans_count = 0;
+                frag->send_time_ms = vtx_get_time_ms();
+                frag->received = false;
+                list_add_tail(&frag->list, &frame->rtx);
+            }
+        }
     }
 
     /* 如果是I帧，缓存以备重传 */
@@ -753,6 +766,12 @@ int vtx_tx_send_media(vtx_tx_t* tx, vtx_frame_t* frame) {
 
         /* 释放旧的I帧 */
         if (tx->last_iframe) {
+            /* 清理旧I帧的rtx队列 */
+            vtx_frag_t *frag, *tmp;
+            list_for_each_entry_safe(frag, tmp, &tx->last_iframe->rtx, list) {
+                list_del(&frag->list);
+                vtx_frag_pool_release(tx->frag_pool, frag);
+            }
             vtx_frame_release(tx->media_pool, tx->last_iframe);
         }
 
@@ -826,6 +845,14 @@ void vtx_tx_destroy(vtx_tx_t* tx) {
     /* 释放I帧 */
     vtx_spinlock_lock(&tx->iframe_lock);
     if (tx->last_iframe) {
+        /* 清理rtx队列 */
+        if (tx->frag_pool) {
+            vtx_frag_t *frag, *tmp;
+            list_for_each_entry_safe(frag, tmp, &tx->last_iframe->rtx, list) {
+                list_del(&frag->list);
+                vtx_frag_pool_release(tx->frag_pool, frag);
+            }
+        }
         vtx_frame_release(tx->media_pool, tx->last_iframe);
         tx->last_iframe = NULL;
     }
