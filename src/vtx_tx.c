@@ -46,6 +46,7 @@ struct vtx_tx {
     /* 内存池 */
     vtx_frame_pool_t*      media_pool;       /* 媒体帧池 */
     vtx_frame_pool_t*      data_pool;        /* 数据帧池 */
+    vtx_frag_pool_t*       frag_pool;        /* 分片池 */
 
     /* 发送队列 */
     vtx_frame_queue_t*     send_queue;       /* 待发送队列 */
@@ -460,10 +461,12 @@ vtx_tx_t* vtx_tx_create(
                                            VTX_MEDIA_FRAME_DATA_SIZE);
     tx->data_pool = vtx_frame_pool_create(VTX_FRAME_POOL_INIT_SIZE * 4,
                                           VTX_CTRL_FRAME_DATA_SIZE);
-    if (!tx->media_pool || !tx->data_pool) {
+    tx->frag_pool = vtx_frag_pool_create(128);  /* 默认128个分片 */
+    if (!tx->media_pool || !tx->data_pool || !tx->frag_pool) {
         vtx_log_error("Failed to create frame pools");
         if (tx->media_pool) vtx_frame_pool_destroy(tx->media_pool);
         if (tx->data_pool) vtx_frame_pool_destroy(tx->data_pool);
+        if (tx->frag_pool) vtx_frag_pool_destroy(tx->frag_pool);
         close(tx->sockfd);
         vtx_free(tx);
         return NULL;
@@ -835,6 +838,7 @@ void vtx_tx_destroy(vtx_tx_t* tx) {
     /* 销毁内存池 */
     if (tx->media_pool) vtx_frame_pool_destroy(tx->media_pool);
     if (tx->data_pool) vtx_frame_pool_destroy(tx->data_pool);
+    if (tx->frag_pool) vtx_frag_pool_destroy(tx->frag_pool);
 
     /* 销毁锁 */
     vtx_spinlock_destroy(&tx->iframe_lock);
