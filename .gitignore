@@ -10,6 +10,13 @@ Makefile
 *.cmake
 !CMakeLists.txt
 
+CLAUDE.md
+
+data/*.mp4
+
+.claude
+.vscode
+
 # Compiled Object files
 *.o
 *.obj

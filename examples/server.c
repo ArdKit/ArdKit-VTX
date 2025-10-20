@@ -28,6 +28,11 @@
 /* 全局标志 */
 static volatile int g_running = 1;
 static volatile int g_streaming = 0;  /* 媒体流状态：0=停止，1=发送中 */
+static char g_media_file[256] = "";   /* 当前媒体文件路径 */
+static pthread_mutex_t g_media_lock = PTHREAD_MUTEX_INITIALIZER;  /* 保护 g_media_file */
+static char g_root_dir[256] = "data"; /* 媒体文件根目录 */
+static pthread_t g_media_tid = 0;     /* 媒体线程ID */
+static vtx_tx_t* g_tx = NULL;         /* TX对象（供回调使用） */
 
 /* FFmpeg上下文 */
 typedef struct {
@@ -54,15 +59,84 @@ static void signal_handler(int sig) {
     vtx_log_info("Received signal, shutting down...");
 }
 
+/* 媒体线程声明 */
+static void* media_thread(void* arg);
+
 /* 媒体控制回调 */
-static void on_media(bool start, void* userdata) {
+static void on_media(vtx_data_type_t data_type, const char* url, void* userdata) {
     (void)userdata;
-    if (start) {
+
+    if (data_type == VTX_DATA_START) {
+        /* 如果已经在播放，先停止 */
+        if (g_streaming && g_media_tid != 0) {
+            vtx_log_info("Stopping current media stream...");
+            g_streaming = 0;
+            pthread_join(g_media_tid, NULL);
+            g_media_tid = 0;
+        }
+
+        /* 处理URL参数，构建完整文件路径 */
+        char temp_file[256];
+        if (url && url[0] != '\0') {
+            /* URL格式: /path/to/file?offset=10,size=20
+             * 如果以'/'开头，去掉'/'，作为相对于根目录的路径
+             */
+            const char* file_path = url;
+            if (file_path[0] == '/') {
+                file_path++;  /* 跳过开头的'/' */
+            }
+
+            /* 提取文件路径（去掉查询参数） */
+            const char* query_start = strchr(file_path, '?');
+            size_t path_len = query_start ? (size_t)(query_start - file_path) : strlen(file_path);
+
+            /* 构建完整路径: root_dir + "/" + file_path */
+            if (path_len > 0) {
+                size_t root_len = strlen(g_root_dir);
+                if (root_len + 1 + path_len < sizeof(temp_file)) {
+                    snprintf(temp_file, sizeof(temp_file), "%s/%.*s",
+                            g_root_dir, (int)path_len, file_path);
+                    vtx_log_info("START media streaming: %s", temp_file);
+                } else {
+                    vtx_log_error("File path too long, cannot start streaming");
+                    return;
+                }
+            } else {
+                vtx_log_error("Empty file path, cannot start streaming");
+                return;
+            }
+        } else {
+            vtx_log_error("No URL provided, cannot start streaming");
+            return;
+        }
+
+        /* 使用互斥锁保护 g_media_file */
+        pthread_mutex_lock(&g_media_lock);
+        strncpy(g_media_file, temp_file, sizeof(g_media_file) - 1);
+        g_media_file[sizeof(g_media_file) - 1] = '\0';
+        pthread_mutex_unlock(&g_media_lock);
+
+        /* 启动媒体线程 - 先创建线程，成功后再设置状态 */
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, media_thread, g_tx) != 0) {
+            vtx_log_error("Failed to create media thread");
+            return;
+        }
+
+        /* 线程创建成功，设置状态 */
+        g_media_tid = tid;
         g_streaming = 1;
-        vtx_log_info("START media streaming");
-    } else {
-        g_streaming = 0;
-        vtx_log_info("STOP media streaming");
+        vtx_log_info("Media thread started");
+
+    } else if (data_type == VTX_DATA_STOP) {
+        /* 停止媒体线程 */
+        if (g_streaming && g_media_tid != 0) {
+            vtx_log_info("STOP media streaming");
+            g_streaming = 0;
+            pthread_join(g_media_tid, NULL);
+            g_media_tid = 0;
+            vtx_log_info("Media thread stopped");
+        }
     }
 }
 
@@ -170,12 +244,19 @@ static void* media_thread(void* arg) {
     vtx_tx_t* tx = (vtx_tx_t*)arg;
     ffmpeg_ctx_t ffmpeg;
     AVPacket* pkt = NULL;
+    char media_file[256];
 
     vtx_log_info("Media thread started");
 
-    /* 初始化FFmpeg，读取H.264文件 */
-    if (init_ffmpeg(&ffmpeg, "data/h264_30fps.mp4") != 0) {
-        vtx_log_error("Failed to initialize FFmpeg");
+    /* 使用互斥锁读取媒体文件路径 */
+    pthread_mutex_lock(&g_media_lock);
+    strncpy(media_file, g_media_file, sizeof(media_file) - 1);
+    media_file[sizeof(media_file) - 1] = '\0';
+    pthread_mutex_unlock(&g_media_lock);
+
+    /* 初始化FFmpeg，读取媒体文件 */
+    if (init_ffmpeg(&ffmpeg, media_file) != 0) {
+        vtx_log_error("Failed to initialize FFmpeg with file: %s", media_file);
         return NULL;
     }
 
@@ -270,7 +351,7 @@ static void* poll_thread(void* arg) {
 
 int main(int argc, char* argv[]) {
     int ret;
-    pthread_t poll_tid, media_tid;
+    pthread_t poll_tid;
 
     /* 解析命令行 */
     const char* bind_addr = "0.0.0.0";
@@ -282,6 +363,7 @@ int main(int argc, char* argv[]) {
 
     vtx_log_info("=== VTX Server ===");
     vtx_log_info("Binding to %s:%u", bind_addr, bind_port);
+    vtx_log_info("Media root directory: %s", g_root_dir);
 
     /* 注册信号处理 */
     signal(SIGINT, signal_handler);
@@ -306,11 +388,15 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    /* 设置全局TX对象（供回调使用） */
+    g_tx = tx;
+
     /* 监听 */
     ret = vtx_tx_listen(tx);
     if (ret != VTX_OK) {
         vtx_log_error("Failed to listen: %d", ret);
         vtx_tx_destroy(tx);
+        g_tx = NULL;
         return EXIT_FAILURE;
     }
 
@@ -320,22 +406,30 @@ int main(int argc, char* argv[]) {
     if (ret != VTX_OK) {
         vtx_log_error("Failed to accept: %d", ret);
         vtx_tx_destroy(tx);
+        g_tx = NULL;
         return EXIT_FAILURE;
     }
 
     vtx_log_info("Client connected!");
 
-    /* 创建线程 */
+    /* 创建poll线程 */
     pthread_create(&poll_tid, NULL, poll_thread, tx);
-    pthread_create(&media_tid, NULL, media_thread, tx);
 
-    /* 等待线程结束 */
+    /* 等待poll线程结束 */
     pthread_join(poll_tid, NULL);
-    pthread_join(media_tid, NULL);
+
+    /* 停止媒体线程（如果正在运行） */
+    if (g_streaming && g_media_tid != 0) {
+        vtx_log_info("Stopping media thread...");
+        g_streaming = 0;
+        pthread_join(g_media_tid, NULL);
+        g_media_tid = 0;
+    }
 
     /* 清理 */
     vtx_tx_close(tx);
     vtx_tx_destroy(tx);
+    g_tx = NULL;
 
     vtx_log_info("Server stopped");
 

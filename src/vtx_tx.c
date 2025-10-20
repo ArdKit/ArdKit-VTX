@@ -567,19 +567,40 @@ static int vtx_recv(vtx_tx_t* tx) {
         break;
     }
 
-    case VTX_DATA_START:
-        /* 开始媒体传输 */
-        vtx_log_info("Client requested START media");
+    case VTX_DATA_START: {
+        /* 开始媒体传输，从payload中提取URL */
+        const char* url = NULL;
+        size_t payload_len = n - VTX_PACKET_HEADER_SIZE;
+
+        if (payload_len > 0 && payload_len < VTX_MAX_URL_SIZE) {
+            /* 验证payload以NULL终止符结尾 */
+            const uint8_t* payload = buf + VTX_PACKET_HEADER_SIZE;
+            if (payload[payload_len - 1] == '\0') {
+                /* payload是有效的NULL终止字符串 */
+                url = (const char*)payload;
+                vtx_log_info("Client requested START media with URL: %s", url);
+            } else {
+                vtx_log_warn("Invalid URL in START frame: missing null terminator");
+                vtx_log_info("Client requested START media (using default)");
+            }
+        } else if (payload_len > 0) {
+            vtx_log_warn("URL too long (%zu bytes), ignoring", payload_len);
+            vtx_log_info("Client requested START media (using default)");
+        } else {
+            vtx_log_info("Client requested START media (default source)");
+        }
+
         if (tx->media_fn) {
-            tx->media_fn(true, tx->userdata);
+            tx->media_fn(VTX_DATA_START, url, tx->userdata);
         }
         break;
+    }
 
     case VTX_DATA_STOP:
         /* 停止媒体传输 */
         vtx_log_info("Client requested STOP media");
         if (tx->media_fn) {
-            tx->media_fn(false, tx->userdata);
+            tx->media_fn(VTX_DATA_STOP, NULL, tx->userdata);
         }
         break;
 

@@ -108,6 +108,8 @@ typedef struct {
     uint16_t    mtu;          /* MTU大小，默认1400字节 */
     uint32_t    recv_buf_size; /* 接收缓冲区大小 */
     uint32_t    frame_timeout_ms; /* 帧接收超时（默认100ms） */
+    uint32_t    data_retrans_timeout_ms; /* DATA包重传超时（默认30ms） */
+    uint8_t     data_max_retrans; /* DATA包最大重传次数（默认3次） */
     uint32_t    heartbeat_interval_ms; /* 心跳发送间隔（默认60000ms=1分钟） */
 } vtx_rx_config_t;
 
@@ -196,15 +198,20 @@ typedef void (*vtx_on_connect_fn)(
 /**
  * @brief 媒体控制回调（TX端使用）
  *
- * @param start true表示开始发送媒体，false表示停止发送媒体
+ * @param data_type 数据类型：VTX_DATA_START 或 VTX_DATA_STOP
+ * @param url 媒体URL（仅当 data_type == VTX_DATA_START 时有效）
+ *            格式：/path/to/file?offset=10,size=20
+ *            如果为NULL或空字符串，表示使用默认媒体源
  * @param userdata 用户数据
  */
 typedef void (*vtx_on_media_fn)(
-    bool start,
+    vtx_data_type_t data_type,
+    const char* url,
     void* userdata);
 
 /* ========== 常量定义 ========== */
 
+#define VTX_MAX_URL_SIZE          100
 #define VTX_DEFAULT_MTU           1400
 #define VTX_MAX_FRAME_SIZE        (512 * 1024)  /* 512KB */
 #define VTX_DEFAULT_SEND_BUF      (2 * 1024 * 1024)  /* 2MB */

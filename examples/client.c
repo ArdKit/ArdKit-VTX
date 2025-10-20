@@ -216,11 +216,12 @@ int main(int argc, char* argv[]) {
     vtx_log_info("Connected successfully!");
 
     /* 请求开始媒体传输 */
-    ret = vtx_rx_start(rx);
+    const char* media_url = "/h264_30fps.mp4";  /* 相对于服务器根目录(data) */
+    ret = vtx_rx_start(rx, media_url);
     if (ret != VTX_OK) {
         vtx_log_error("Failed to send START request: %d", ret);
     } else {
-        vtx_log_info("Requested media streaming from server");
+        vtx_log_info("Requested media streaming from server: %s", media_url);
     }
 
     /* 主循环：定期发送测试数据 */

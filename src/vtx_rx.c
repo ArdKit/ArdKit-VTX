@@ -336,7 +336,7 @@ static void vtx_process_retrans_queue(vtx_rx_t* rx) {
 
     list_for_each_entry_safe(frame, tmp, &rx->data_queue->frames, list) {
         /* 检查重传次数是否超限 */
-        if (frame->retrans_count >= 3) {
+        if (frame->retrans_count >= rx->config.data_max_retrans) {
             vtx_log_warn("Frame dropped: id=%u, retrans=%u",
                        frame->frame_id, frame->retrans_count);
 
@@ -353,7 +353,7 @@ static void vtx_process_retrans_queue(vtx_rx_t* rx) {
 
         /* 检查是否需要重传 */
         uint64_t elapsed = now_ms - frame->send_time_ms;
-        if (elapsed >= 100) {  /* 100ms 超时 */
+        if (elapsed >= rx->config.data_retrans_timeout_ms) {
             /* 需要重传 */
             frame->retrans_count++;
             frame->send_time_ms = now_ms;
@@ -546,6 +546,12 @@ vtx_rx_t* vtx_rx_create(
     }
     if (rx->config.frame_timeout_ms == 0) {
         rx->config.frame_timeout_ms = VTX_DEFAULT_FRAME_TIMEOUT_MS;
+    }
+    if (rx->config.data_retrans_timeout_ms == 0) {
+        rx->config.data_retrans_timeout_ms = VTX_DEFAULT_DATA_RETRANS_TIMEOUT_MS;
+    }
+    if (rx->config.data_max_retrans == 0) {
+        rx->config.data_max_retrans = VTX_DEFAULT_MAX_RETRANS;
     }
     if (rx->config.heartbeat_interval_ms == 0) {
         rx->config.heartbeat_interval_ms = VTX_DEFAULT_HEARTBEAT_INTERVAL_MS;
@@ -765,7 +771,7 @@ int vtx_rx_send(vtx_rx_t* rx, const uint8_t* data, size_t size) {
     return VTX_OK;
 }
 
-int vtx_rx_start(vtx_rx_t* rx) {
+int vtx_rx_start(vtx_rx_t* rx, const char* url) {
     if (!rx) {
         return VTX_ERR_INVALID_PARAM;
     }
@@ -774,12 +780,27 @@ int vtx_rx_start(vtx_rx_t* rx) {
         return VTX_ERR_NOT_READY;
     }
 
-    /* 发送START控制帧 */
+    /* 准备URL数据（最大100字节，超过部分截断） */
+    uint8_t url_buf[VTX_MAX_URL_SIZE];
+    size_t url_len = 0;
+
+    if (url && url[0] != '\0') {
+        url_len = strlen(url);
+        if (url_len >= VTX_MAX_URL_SIZE) {
+            url_len = VTX_MAX_URL_SIZE - 1;  /* 保留一个字节给'\0' */
+            vtx_log_warn("URL truncated from %zu to %zu bytes", strlen(url), url_len);
+        }
+        memcpy(url_buf, url, url_len);
+        url_buf[url_len] = '\0';
+        url_len++;  /* 包含'\0' */
+    }
+
+    /* 发送START控制帧，携带URL参数 */
     vtx_packet_header_t header = {0};
     header.seq_num = atomic_fetch_add(&rx->seq_num, 1);
     header.frame_type = VTX_DATA_START;
 
-    int ret = vtx_send_packet(rx, &header, NULL, 0);
+    int ret = vtx_send_packet(rx, &header, url_len > 0 ? url_buf : NULL, url_len);
     if (ret != VTX_OK) {
         vtx_log_error("Failed to send START: %d", ret);
         return ret;

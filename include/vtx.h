@@ -284,13 +284,16 @@ int vtx_rx_send(vtx_rx_t* rx, const uint8_t* data, size_t size);
  * @brief 请求开始媒体传输
  *
  * @param rx 接收端对象
+ * @param url 媒体URL参数（可为NULL），格式：/path/to/file?offset=10,size=20
+ *            最大100字节，超出部分会被截断
  * @return 0成功，负数表示错误码
  *
  * 注意：
- * - 发送START控制帧到服务器
+ * - 发送START控制帧到服务器，payload中携带URL参数
  * - 服务器收到后通过media_fn回调通知应用层开始发送媒体数据
+ * - URL为NULL或空字符串表示使用默认媒体源
  */
-int vtx_rx_start(vtx_rx_t* rx);
+int vtx_rx_start(vtx_rx_t* rx, const char* url);
 
 /**
  * @brief 请求停止媒体传输

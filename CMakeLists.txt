@@ -86,7 +86,7 @@ find_package(PkgConfig)
 if(PkgConfig_FOUND)
     pkg_check_modules(FFMPEG QUIET libavformat libavcodec libavutil)
     if(FFMPEG_FOUND)
-        add_executable(server cmd/server.c)
+        add_executable(server examples/server.c)
         target_include_directories(server PRIVATE ${FFMPEG_INCLUDE_DIRS})
         target_link_directories(server PRIVATE ${FFMPEG_LIBRARY_DIRS})
         target_link_libraries(server vtx pthread ${FFMPEG_LDFLAGS})
@@ -96,7 +96,7 @@ if(PkgConfig_FOUND)
     endif()
 endif()
 
-add_executable(client cmd/client.c)
+add_executable(client examples/client.c)
 target_link_libraries(client vtx pthread)
 
 # 安装规则
