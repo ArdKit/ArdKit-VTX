@@ -10,6 +10,7 @@
  */
 
 #include "vtx.h"
+#include "vtx_frame.h"
 #include "vtx_packet.h"
 #include "vtx_log.h"
 #include <stdio.h>
@@ -133,12 +134,33 @@ static void cleanup_ffmpeg(ffmpeg_ctx_t* ctx) {
 
 /* 发送媒体帧 */
 static int send_media_frame(vtx_tx_t* tx, AVPacket* pkt, vtx_frame_type_t frame_type) {
-    /* TODO: 实现帧分片发送逻辑 */
-    /* 当前vtx_tx没有公开的发送媒体帧API，这里先打印日志 */
-    vtx_log_debug("Would send frame: type=%d size=%d", frame_type, pkt->size);
+    /* 从TX分配media frame */
+    vtx_frame_t* frame = vtx_tx_alloc_media_frame(tx);
+    if (!frame) {
+        vtx_log_error("Failed to allocate media frame");
+        return VTX_ERR_NO_MEMORY;
+    }
 
-    /* 暂时使用vtx_tx_send发送（这不是正确的方式，仅作示例） */
-    /* 正确的做法是添加vtx_tx_send_frame API */
+    /* 复制packet数据到frame */
+    size_t copied = vtx_frame_copyto(frame, 0, pkt->data, pkt->size);
+    if (copied != (size_t)pkt->size) {
+        vtx_log_error("Failed to copy packet data: copied=%zu expected=%d", copied, pkt->size);
+        vtx_tx_free_frame(tx, frame);
+        return VTX_ERR_INVALID_PARAM;
+    }
+
+    /* 设置帧类型 */
+    frame->frame_type = frame_type;
+
+    /* 发送媒体帧 */
+    int ret = vtx_tx_send_media(tx, frame);
+    if (ret != VTX_OK) {
+        vtx_log_error("Failed to send media frame: %d", ret);
+        /* 注意：vtx_tx_send_media 失败时已经释放了 frame */
+        return ret;
+    }
+
+    vtx_log_debug("Sent frame: type=%d size=%d", frame_type, pkt->size);
 
     return VTX_OK;
 }
