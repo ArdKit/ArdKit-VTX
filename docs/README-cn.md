@@ -2,9 +2,9 @@
 
 简体中文 | [English](../README.md)
 
-[![Version](https://img.shields.io/badge/version-2.0.5-blue.svg)](https://github.com/xbitsmaster/vtx)
+[![Version](https://img.shields.io/badge/version-2.0.5-blue.svg)](https://github.com/ArdKit/ArdKit-VTX)
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](BUILD.md)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 VTX是一个基于UDP的实时视频传输协议库，专为低延迟、高可靠性的视频传输场景设计。
 
@@ -296,7 +296,7 @@ DEBUG模式特性：
 
 ## 许可证
 
-MIT License
+Apache License 2.0
 
 ## 文档
 
@@ -329,7 +329,7 @@ VTX开发团队
 
 ## 许可证
 
-MIT License - 详见 [LICENSE](LICENSE) 文件
+Apache License 2.0 - 详见 [LICENSE](LICENSE) 文件
 
 ## 贡献
 

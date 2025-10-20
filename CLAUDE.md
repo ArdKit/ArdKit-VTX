@@ -371,7 +371,7 @@ tar -czf vtx-1.0.0.tar.gz --exclude=.git --exclude=.claude vtx/
 
 ## 15. 许可证
 
-本项目采用MIT许可证。详见LICENSE文件。
+本项目采用Apache License 2.0许可证。详见LICENSE文件。
 
 ---
 

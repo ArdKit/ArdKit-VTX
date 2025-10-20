@@ -372,7 +372,7 @@ P帧：丢失不重传，直接丢弃
 
 ## 支持
 
-问题反馈: [GitHub Issues](https://github.com/your-repo/vtx/issues)
+问题反馈: [GitHub Issues](https://github.com/ArdKit/ArdKit-VTX/issues)
 
 ---
 

@@ -2,9 +2,9 @@
 
 [简体中文](docs/README-cn.md) | English
 
-[![Version](https://img.shields.io/badge/version-2.0.5-blue.svg)](https://github.com/xbitsmaster/vtx)
+[![Version](https://img.shields.io/badge/version-2.0.5-blue.svg)](https://github.com/ArdKit/ArdKit-VTX)
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](BUILD.md)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 VTX is a UDP-based real-time video transmission protocol library designed for low-latency, high-reliability video streaming scenarios.
 
@@ -296,7 +296,7 @@ DEBUG mode features:
 
 ## License
 
-MIT License
+Apache License 2.0
 
 ## Documentation
 
@@ -329,7 +329,7 @@ VTX Development Team
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) file for details
+Apache License 2.0 - See [LICENSE](LICENSE) file for details
 
 ## Contributing
 
