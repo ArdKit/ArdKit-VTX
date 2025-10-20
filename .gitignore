@@ -55,6 +55,8 @@ client
 *.h265
 *.yuv
 *.log
+*.pid
+data/output.*
 
 # Core dumps
 core
