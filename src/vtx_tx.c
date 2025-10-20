@@ -301,6 +301,72 @@ static void vtx_process_retrans_queue(vtx_tx_t* tx) {
     }
 
     vtx_spinlock_unlock(&tx->data_queue->lock);
+
+    /* 处理I帧分片重传 */
+    vtx_spinlock_lock(&tx->iframe_lock);
+    if (tx->last_iframe) {
+        vtx_frag_t *frag, *tmp_frag;
+        vtx_frame_t* iframe = tx->last_iframe;
+        size_t payload_capacity = tx->config.mtu - VTX_PACKET_HEADER_SIZE;
+
+        list_for_each_entry_safe(frag, tmp_frag, &iframe->rtx, list) {
+            /* 检查重传次数是否超限 */
+            if (frag->retrans_count >= tx->config.max_retrans) {
+                vtx_log_warn("I-frame fragment dropped: frame_id=%u, frag=%u, retrans=%u",
+                           iframe->frame_id, frag->frag_index, frag->retrans_count);
+
+                /* 从队列移除并释放 */
+                list_del(&frag->list);
+                vtx_frag_pool_release(tx->frag_pool, frag);
+                continue;
+            }
+
+            /* 检查是否需要重传 */
+            uint64_t elapsed = now_ms - frag->send_time_ms;
+            if (elapsed >= tx->config.retrans_timeout_ms) {
+                /* 需要重传此分片 */
+                frag->retrans_count++;
+                frag->send_time_ms = now_ms;
+
+                vtx_log_debug("Retransmitting I-frame fragment: frame_id=%u, frag=%u/%u, retrans=%u",
+                            iframe->frame_id, frag->frag_index, iframe->total_frags,
+                            frag->retrans_count);
+
+                /* 计算分片载荷 */
+                size_t offset = frag->frag_index * payload_capacity;
+                size_t payload_size = iframe->data_size - offset;
+                if (payload_size > payload_capacity) {
+                    payload_size = payload_capacity;
+                }
+
+                /* 重新发送分片 */
+                vtx_packet_header_t header = {0};
+                header.seq_num = atomic_fetch_add(&tx->seq_num, 1);
+                header.frame_id = iframe->frame_id;
+                header.frame_type = iframe->frame_type;
+                header.frag_index = frag->frag_index;
+                header.total_frags = iframe->total_frags;
+                header.payload_size = payload_size;
+                header.flags = VTX_FLAG_RETRANS;
+
+                if (frag->frag_index == iframe->total_frags - 1) {
+                    header.flags |= VTX_FLAG_LAST_FRAG;
+                }
+
+                vtx_spinlock_unlock(&tx->iframe_lock);
+
+                vtx_send_packet(tx, &header, iframe->data + offset, payload_size);
+
+                /* 更新统计 */
+                vtx_spinlock_lock(&tx->stats_lock);
+                tx->stats.retrans_packets++;
+                vtx_spinlock_unlock(&tx->stats_lock);
+
+                vtx_spinlock_lock(&tx->iframe_lock);
+            }
+        }
+    }
+    vtx_spinlock_unlock(&tx->iframe_lock);
 }
 
 /**
