@@ -100,6 +100,9 @@ typedef struct vtx_frame {
     /* 重传队列（细粒度分片管理） */
     struct list_head rtx;            /* 重传队列（vtx_frag_t链表） */
 
+    /* 分片接收bitmap（RX端使用，动态分配） */
+    uint8_t*         bitmap;         /* 分片接收位图 */
+
     /* 帧数据（动态分配） */
     uint8_t*         data;           /* 帧数据缓冲区指针 */
 } vtx_frame_t;
