@@ -46,6 +46,10 @@ client
 *~
 .DS_Store
 
+# Backup files
+*.bak
+*.bak2
+
 # Test outputs
 *.h264
 *.h265
